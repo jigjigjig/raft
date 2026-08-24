@@ -19,6 +19,14 @@ def client(tmp_path_factory) -> TestClient:
     directory = tmp_path_factory.mktemp("api")
     import os
 
+    # Settings reads .env, which on a configured machine points at a live
+    # gateway. A test suite that changes behaviour depending on who runs it is
+    # worthless, so pin every field this fixture depends on.
+    os.environ["RAFT_OTARI_MODE"] = "mock"
+    os.environ["RAFT_LLM_PROVIDER"] = "otari"
+    os.environ["RAFT_EMBEDDING_BACKEND"] = "local"
+    for role in ("TRACE_LABELER", "ASPECT_EVALUATOR", "CLUSTER_NAMER", "AUTOPSY_WRITER", "SPAN_EXPLAINER", "PLANNER"):
+        os.environ.pop(f"OTARI_{role}_API_KEY", None)
     os.environ["RAFT_DATABASE_PATH"] = str(directory / "raft.db")
     os.environ["RAFT_DEMO_TRACE_COUNT"] = "200"
     os.environ["RAFT_MODEL_ROLES_PATH"] = str(Path(__file__).resolve().parents[1] / "model-roles.yaml")
@@ -256,3 +264,27 @@ def test_preflight_reports_configuration_rather_than_failing(client: TestClient)
     body = client.get("/api/settings/preflight").json()
     assert body["checked"] is False
     assert "not live" in body["reason"]
+
+
+def test_a_broad_question_is_labelled_and_offers_a_way_forward(client: TestClient) -> None:
+    """The behaviour that made the product look broken.
+
+    "What should I fix first?" uses no word these conversations contain, so it
+    cannot be narrowed. Returning the dataset-wide grouping is correct; passing
+    it off as a precise answer is not. It must be flagged, and it must offer
+    questions built from the data's own words.
+    """
+    answer = ask(client, "What should I fix first?")
+    assert answer["is_overview"] is True
+    assert answer["headline"].startswith("Overview of")
+    assert answer["suggestions"], "a dead end must offer a way forward"
+
+    # And those suggestions must actually work when clicked.
+    followed = ask(client, answer["suggestions"][0])
+    assert followed["is_overview"] is False
+    assert followed["denominator"] < answer["denominator"]
+
+
+def test_a_specific_question_is_not_flagged_as_an_overview(client: TestClient) -> None:
+    answer = ask(client, "Which app do users give up on most?")
+    assert answer["is_overview"] is False

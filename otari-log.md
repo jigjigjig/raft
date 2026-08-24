@@ -22,7 +22,18 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## Guardrails
 
-> I used feature Guardrails to achieve a privacy and prompt-injection checkpoint. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **Guardrails** to achieve a prompt-injection and privacy checkpoint over
+> untrusted trace text before it reaches a model. I found the request shape, the absence of a
+> second endpoint, and the absence of a separate SDK easy: guardrails are one
+> `guardrails: [{"profile": ..., "mode": "block"}]` array on the chat body I was already
+> sending, so turning the feature on cost one `if` in `raft/otari.py`. I struggled with the
+> failure mode, the undiagnosable status code, and the missing verdict, because a deployment
+> with no guardrails service answers `502 guardrail profile 'prompt-injection' requested but
+> no guardrails service is configured` and fails the *entire* completion rather than the
+> optional layer; because a 502 cannot be told apart from "temporarily down", so failing
+> closed was not safe either; and because I never once saw a successful verdict, so I still
+> do not know what a pass or a block actually looks like on the wire. Raft therefore drops
+> the guardrail block, retries once, and records the feature as unavailable.
 
 - Status: **implemented locally; live Otari evidence pending**
 - Date/workspace: **pending** / `trace-labeler`
@@ -42,7 +53,23 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## Routing
 
-> I used feature Routing to achieve model tiering and provider fallback. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **Routing** to achieve six role-specific model tiers behind one base URL and
+> one credential. I found role assignment, provider abstraction, and final-model reporting
+> easy: swapping a 30B for a 70B for a whole role is a one-line `model-roles.yaml` edit with
+> no code change, every provider is reachable through the same `/v1/chat/completions`, and the
+> response's own `model` field let me show the user which model really answered. I struggled
+> with catalog trust, deployment-dependent paths, unnormalised parameters, and unadvertised
+> latency, because a model id from the published catalog is not proof a given key can reach
+> it (I wrote `scripts/otari_setup.py` purely to discover per-key reachability before a demo
+> instead of during one); because management routes live at `/v1/models` on standalone and
+> `/api/v1/models` on hosted, which made every model look missing until I added a
+> `raft_otari_deployment` switch; because per-model parameter incompatibility arrives as an
+> undifferentiated HTTP 400 (`temperature` "deprecated for this model"), so the gateway
+> passes provider quirks straight through and I had to write a retry-minus-one-parameter
+> loop; and because same-size models differ ~4x in latency (Hermes-4-70B 2.5 s median versus
+> Llama-3.3-70B 12–20 s and one 90 s timeout) with nothing in the API to hint it, so I had to
+> measure it myself and give the naming call its own 20 s leash. No provider-level fallback
+> ever fired, so Raft's "fallbacks" are its own retries, not Otari routing.
 
 - Status: **configuration implemented; live route and fallback evidence pending**
 - Date/workspace: **pending** / all six role workspaces
@@ -60,7 +87,19 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## MCP Servers
 
-> I used feature MCP Servers to achieve read-only planner access to Raft's redacted trace table. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **MCP Servers** to achieve read-only planner access to Raft's redacted trace
+> table. I found the client-side wiring, the server-side surface, and the tool schemas easy:
+> passing `mcp_server_ids` is one more field on the chat body, and exposing five read-only
+> tools took a 154-line JSON-RPC endpoint (`raft/mcp.py`) with no MCP library. I struggled
+> with reachability, out-of-band registration, and unobservable tool use, because the server
+> must be publicly reachable — so a product running on `localhost:8010` cannot use the
+> feature at all without standing up a tunnel first, which is the single biggest blocker here;
+> because registration happens outside the request that uses it, so the thing I need at
+> inference time is state I have to have arranged earlier through a different surface; and
+> because the response says nothing about which tools were actually invoked, so I can neither
+> verify the call happened nor show the user honestly — Raft's progress panel can only relay
+> the planner's own claim about what it inspected. Net result: no recorded MCP tool call, and
+> the deterministic local question compiler in `raft/query.py` is what ships.
 
 - Status: **local Streamable HTTP-compatible JSON-RPC endpoint implemented; hosted registration pending**
 - Date/workspace: **pending** / `planner`
@@ -79,7 +118,18 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## Budgets
 
-> I used feature Budgets to achieve a user-visible cost confirmation and resumable budget stop. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **Budgets** to achieve a cost ceiling a user can trust before authorising a
+> run over 847 conversations. I found having nothing to integrate easy: the ceiling lives on
+> the API key, so it is enforced server-side and no client bug can spend past it — that is
+> the right place for it. I struggled with granularity, missing cost in `usage`, no
+> pre-flight check, and never seeing the rejection, because the only shape available is a
+> per-key hard stop while a product needs a per-*run* ceiling, so I built the estimate,
+> confirmation, checkpoint, pause and resume myself and Otari is only the outer backstop;
+> because the `usage` object on these models carries no cost field, so Raft prices its own
+> calls from a local table and cannot show the user Otari's number; because there is no "would
+> this run fit in the remaining allowance" call, so my "About \$0.06" confirmation is my
+> arithmetic rather than the gateway's; and because I never provoked the 403, so
+> `test_budget_pause_preserves_rows_and_resumes` exercises Raft's ceiling, not Otari's.
 
 - Status: **local estimate, confirmation, checkpoint, pause, and resume implemented; live Otari 403 pending**
 - Date/workspace: **pending** / `aspect-evaluator`
@@ -99,7 +149,20 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## Code Execution
 
-> I used feature Code Execution to achieve deterministic counts for every answer. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **Code Execution** to achieve deterministic counts, because the product's
+> hard rule is that no model may count. I found the session model and keeping ownership of the
+> code easy: create / exec / delete is a small honest API, and it let Raft own the Python
+> source so the code shown in "Show the work" is literally the string that produced the
+> number. I struggled with availability, getting data *in*, and two competing shapes for one
+> feature, because hosted Otari answers `503 code execution backend is not configured
+> (SANDBOX_BACKEND_URL unset)`; because there is no upload route, so the only way to get an
+> 847-row table into a session is to stream it through `exec` calls as string chunks under
+> the 2 MiB request cap and `"".join` them back — a data-plane workaround for a missing
+> data-plane primitive, and it is the ugliest code I wrote against Otari; and because the
+> feature exists both as a declared tool (`tools: [{"type":"otari_code_execution"}]`) and as
+> directly-driven sessions with no guidance on which is authoritative, so I implemented the
+> one I could reason about. Aggregation therefore runs in-process, and the UI names which
+> path executed rather than implying the sandbox.
 
 - Status: **fixed aggregation code and local reference implemented; live sandbox session pending**
 - Date/workspace: **pending** / `aspect-evaluator`
@@ -118,7 +181,16 @@ This file is competition evidence, not marketing copy. Entries are written after
 
 ## Web Search Enablement
 
-> I used feature Web Search Enablement to achieve an on-demand explanation of unfamiliar provider error codes. I found M, N, O easy and struggled with A, B, C because D, E, F.
+> I used feature **Web Search Enablement** to achieve an on-demand explanation of provider
+> error codes a user has never seen before. I found the declaration easy: it is one entry in
+> `tools`, identical in shape to code execution, so there was nothing to learn twice. I
+> struggled with having no successful response at all, and therefore with citations and with
+> honest labelling, because I never observed the tool return — so I cannot say whether
+> citations come back, and a citable source is the entire user-facing value of looking
+> something up rather than asking a model to recall it; and because an unverifiable feature
+> cannot be presented as if it worked, the local fallback ships a six-code reference table
+> that states outright "no web search was performed". This is the feature I have the least to
+> say about, which is itself the finding.
 
 - Status: **user flow and Otari request adapter implemented; live search evidence pending**
 - Date/workspace: **pending** / `planner`
@@ -153,6 +225,58 @@ This file is competition evidence, not marketing copy. Entries are written after
 - Reachable application URL: **pending**
 - Journey completed: **pending**
 - Confusion points and fixes: **pending**
+
+## Live run, 24 August 2026
+
+Raft was connected to hosted Otari (`https://api.otari.ai`, management routes
+under `/api/v1`, generation under `/v1`) with a workspace token. Everything
+below is observed, not projected.
+
+| Role | Model | Calls | Avg latency | Max |
+|---|---|---:|---:|---:|
+| planner | `mzai:openai/gpt-oss-120b` | 41 ok, 2 failed | 2.6 s | 3.9 s |
+| aspect_evaluator | `mzai:Qwen/Qwen3-30B-A3B-Instruct-2507` | 1683 ok, 11 failed | 2.5 s | 11.3 s |
+| cluster_namer | `mzai:NousResearch/Hermes-4-70B` | 21 ok, 4 failed | 9.8 s | 90.2 s |
+
+Sample request IDs: `chatcmpl-ea5694ca-61b3-4a76-af77-9a8c04f30ae1`
+(Hermes-4-70B), `chatcmpl-556ff956-8374-423a-a88b-8d8fa8586a28` (gpt-oss-120b).
+
+**One full Layer-3 run:** "which language do my clients speak?" became a
+`category` aspect with the answer set `[English, Spanish, French, German,
+Other]` and was evaluated against all 847 conversations — **English 845
+(99.8%), Other 2** — in 188 s at a concurrency of 12, costing $0.0593 of the
+$0.10 local run allowance. Asking it again is free: the aspect is cached.
+
+### Friction, exactly as encountered
+
+1. **Guardrails are not configured on this deployment.** Every guarded request
+   returned `502 guardrail profile 'prompt-injection' requested but no
+   guardrails service is configured`, which failed the *whole* call rather than
+   degrading. Raft now drops the guardrail block and retries once, recording the
+   feature as unavailable. Owner: arguably Otari — a missing optional service
+   should not 502 the request.
+2. **Reasoning models return `content: null`.** `gpt-oss-120b` and Nemotron Nano
+   emit a `reasoning` field first; with a small `max_tokens` the budget is spent
+   thinking and `content` stays null with `finish_reason: length`. Raft treats
+   an empty completion at length as an error rather than parsing the literal
+   string "None". Owner: Raft.
+3. **`temperature` is rejected by newer Anthropic models** ("deprecated for this
+   model", HTTP 400). Raft now retries once with the offending optional
+   parameter removed.
+4. **Cluster-namer latency is wildly variable.** Llama-3.3-70B measured
+   12–20 s and once timed out at 90 s; Hermes-4-70B measured 2.5 s median on the
+   same payload. Naming is decoration, so it now has its own 20 s budget and
+   falls back to Raft's own group names.
+5. **No sandbox on hosted Otari:** `POST /api/v1/sandbox/sessions` returns
+   `503 code execution backend is not configured (SANDBOX_BACKEND_URL unset)`.
+   Aggregation runs locally, executing the same source it displays.
+6. **No `/v1/embeddings` on hosted** (404), as the PRD predicted. Standalone
+   Otari does mount it. Embeddings remain local.
+7. **A mid-run 502 (`Authorization service unavailable`) corrupted an answer
+   once.** The fallback finished a `category` run with the boolean local judge,
+   producing `English 768, No 76, Yes 1` — two scales in one total. Fixed: a
+   typed aspect now excludes unjudged rows and declares the count instead of
+   guessing them.
 
 ## What runs without Otari, and how well
 

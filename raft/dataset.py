@@ -28,11 +28,22 @@ class TraceView:
 
 
 class DatasetIndex:
-    def __init__(self, db: Database, *, use_bge: bool = False, bge_model: str = "", bge_revision: str = ""):
+    def __init__(
+        self,
+        db: Database,
+        *,
+        use_bge: bool = False,
+        bge_model: str = "",
+        bge_revision: str = "",
+        encoder_factory=None,
+    ):
         self.db = db
         self.use_bge = use_bge
         self.bge_model = bge_model
         self.bge_revision = bge_revision
+        # Called at build time so a gateway that is down at import does not stop
+        # the app from starting on the local fallback.
+        self.encoder_factory = encoder_factory
         self._lock = threading.Lock()
         self._fingerprint: tuple[int, str] | None = None
         self.index: SemanticIndex | None = None
@@ -45,6 +56,7 @@ class DatasetIndex:
         self.user_vectors: np.ndarray = np.zeros((0, 0), dtype=np.float32)
         self.catalog: DatasetCatalog = DatasetCatalog({})
         self._position: dict[str, int] = {}
+        self.encoder_error: str | None = None
 
     # -- lifecycle --------------------------------------------------------
     def fingerprint(self) -> tuple[int, str]:
@@ -118,14 +130,24 @@ class DatasetIndex:
         self._position = {trace_id: position for position, trace_id in enumerate(self.trace_ids)}
 
         stored = [row["embedding"] for row in rows]
+        encoder = None
+        if self.encoder_factory is not None:
+            try:
+                encoder = self.encoder_factory()
+            except Exception as error:  # noqa: BLE001 - fall back, never fail to start
+                self.encoder_error = str(error)
+                encoder = None
         self.index = SemanticIndex.fit(
             self.documents,
             use_bge=self.use_bge,
             bge_model=self.bge_model or "BAAI/bge-small-en-v1.5",
             bge_revision=self.bge_revision or None,
+            encoder=encoder,
         )
         if stored and all(blob for blob in stored):
             candidate = np.stack([np.frombuffer(blob, dtype=np.float32) for blob in stored])
+            # A different backend produces different dimensions; reuse only what
+            # this index could have written.
             if candidate.shape[1] == self.index.dims:
                 self.vectors = candidate
             else:

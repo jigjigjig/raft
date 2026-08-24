@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft, CheckCircle2, ChevronRight, CircleDollarSign,
-  Flame, PauseCircle, Sigma, TriangleAlert,
+  Compass, Flame, PauseCircle, Sigma, TriangleAlert,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -188,6 +188,27 @@ export function AnswerPage() {
 
       {answer && (
         <>
+          {answer.is_overview && (
+            <section className="overview-banner">
+              <Compass size={18} />
+              <div>
+                <strong>This is an overview, not an answer to what you typed.</strong>
+                <p>
+                  Nothing in your question matches the words these conversations use, so Raft could not narrow to a
+                  subject. Below is the shape of the whole dataset. Pick one of these to ask something it can pin
+                  down — each is built from wording the conversations actually contain.
+                </p>
+                <div className="chip-row left">
+                  {answer.suggestions.map((suggestion) => (
+                    <button key={suggestion} type="button" className="chip" onClick={() => ask.mutate(suggestion)}>
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+
           <section className="answer-summary">
             <div className="answer-kicker">
               <CheckCircle2 size={15} /> {answer.denominator.toLocaleString()} conversations counted
@@ -300,8 +321,8 @@ export function AnswerPage() {
               <h2>Keep going</h2>
               <span>Follow-ups inherit this question's scope</span>
             </div>
-            <div className="chip-row">
-              {answer.follow_ups.map((suggestion) => (
+            <div className="chip-row left">
+              {[...answer.follow_ups, ...(answer.is_overview ? [] : answer.suggestions.slice(0, 2))].map((suggestion) => (
                 <button key={suggestion} type="button" className="chip" onClick={() => ask.mutate(suggestion)}>
                   {suggestion}
                 </button>

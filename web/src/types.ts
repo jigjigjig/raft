@@ -102,6 +102,8 @@ export type Answer = {
   unit: string;
   follow_ups: string[];
   standouts: Standout[];
+  is_overview: boolean;
+  suggestions: string[];
   evidence: Array<{
     trace_id: string;
     group_key: string;

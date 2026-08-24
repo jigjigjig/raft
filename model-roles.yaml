@@ -3,48 +3,47 @@ roles:
     label: Trace labeler
     workspace_alias: trace-labeler
     api_key_env: OTARI_TRACE_LABELER_API_KEY
-    primary: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
+    primary: mzai:nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
     fallbacks:
-      - Qwen/Qwen3-30B-A3B-Instruct-2507
+    - mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
     job: Layer 1 judgments and Layer 2 summaries
   aspect_evaluator:
     label: Aspect evaluator
     workspace_alias: aspect-evaluator
     api_key_env: OTARI_ASPECT_EVALUATOR_API_KEY
-    primary: Qwen/Qwen3-30B-A3B-Instruct-2507
+    primary: mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
     fallbacks:
-      - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
+    - mzai:nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
     job: Typed Layer 3 evaluation over every eligible trace
   cluster_namer:
     label: Cluster namer
     workspace_alias: cluster-namer
     api_key_env: OTARI_CLUSTER_NAMER_API_KEY
-    primary: meta-llama/Llama-3.3-70B-Instruct
+    primary: mzai:NousResearch/Hermes-4-70B
     fallbacks:
-      - NousResearch/Hermes-4-70B
+    - mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
     job: Name emergent vector clusters
   autopsy_writer:
     label: Autopsy writer
     workspace_alias: autopsy-writer
     api_key_env: OTARI_AUTOPSY_WRITER_API_KEY
-    primary: NousResearch/Hermes-4-70B
+    primary: mzai:NousResearch/Hermes-4-70B
     fallbacks:
-      - meta-llama/Llama-3.3-70B-Instruct
+    - mzai:meta-llama/Llama-3.3-70B-Instruct
     job: Write concise trace autopsies
   span_explainer:
     label: Span explainer
     workspace_alias: span-explainer
     api_key_env: OTARI_SPAN_EXPLAINER_API_KEY
-    primary: google/gemma-3-27b-it
+    primary: mzai:google/gemma-3-27b-it
     fallbacks:
-      - Qwen/Qwen3-30B-A3B-Instruct-2507
+    - mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
     job: Explain one span and its neighbours
   planner:
     label: Planner
     workspace_alias: planner
     api_key_env: OTARI_PLANNER_API_KEY
-    primary: openai/gpt-oss-120b
+    primary: mzai:openai/gpt-oss-120b
     fallbacks:
-      - Qwen/Qwen3-30B-A3B-Instruct-2507
+    - mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
     job: MCP-driven path selection, aspect definition, and web-search lookup
-

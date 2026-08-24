@@ -252,3 +252,29 @@ async def test_group_labels_are_real_sentences_from_the_data(manager) -> None:
         )
         stem = group["label"].rstrip("…")
         assert any(stem in row["user_request"] for row in rows), group["label"]
+
+
+@pytest.mark.asyncio
+async def test_a_shape_question_that_ignores_your_words_is_flagged(manager) -> None:
+    """The exact defect behind the failure-mode answer.
+
+    "which language do my clients speak?" extracted `language`, `clients` and
+    `speak`, dropped all three, grouped by failure mode and presented that as
+    the answer. The overview guard existed only on the clustering path.
+    """
+    plan = await manager.plan_question("which language do my clients speak?")
+    assert plan.spec["broad"] is True
+    assert not any(line.startswith("Every part of this question") for line in plan.rationale)
+
+    answer = await answer_for(manager, "which language do my clients speak?")
+    assert answer["is_overview"] is True
+    assert answer["suggestions"], "an overview must offer a way forward"
+    # And it must not narrow to a handful of incidental matches.
+    assert answer["denominator"] == manager.db.trace_count()
+
+
+@pytest.mark.asyncio
+async def test_a_question_that_does_name_a_subject_is_not_flagged(manager) -> None:
+    answer = await answer_for(manager, "what do people ask the storefront support about")
+    assert answer["is_overview"] is False
+    assert answer["denominator"] < manager.db.trace_count()

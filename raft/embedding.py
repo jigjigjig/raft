@@ -168,6 +168,7 @@ class SemanticIndex:
         use_bge: bool = False,
         bge_model: str = "BAAI/bge-small-en-v1.5",
         bge_revision: str | None = None,
+        encoder: object | None = None,
         seed: int = 20260821,
     ) -> "SemanticIndex":
         documents = list(documents) or [""]
@@ -213,9 +214,12 @@ class SemanticIndex:
         for token, index in vocabulary.items():
             idf[index] = math.log((1 + total) / (1 + counts[token])) + 1.0
 
-        encoder = None
+        # A supplied encoder (the Otari embeddings client) wins; then the
+        # optional local sentence-transformer; then the corpus-fitted fallback.
         backend = "tfidf_svd"
-        if use_bge:
+        if encoder is not None:
+            backend = getattr(encoder, "name", "remote")
+        elif use_bge:
             encoder = _load_encoder(bge_model, bge_revision)
             if encoder is not None:
                 backend = f"bge:{bge_model}"

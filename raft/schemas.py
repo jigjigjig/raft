@@ -88,6 +88,8 @@ class AspectDefinition(BaseModel):
     type: Literal["boolean", "number", "category", "text"]
     created_from: str
     version: int = 1
+    # Closed answer set for a category aspect, so values can be grouped.
+    labels: list[str] = Field(default_factory=list)
 
 
 class CompiledFilter(BaseModel):
@@ -241,6 +243,11 @@ class Answer(BaseModel):
     spec: dict[str, Any] = Field(default_factory=dict)
     follow_ups: list[str] = Field(default_factory=list)
     standouts: list[Standout] = Field(default_factory=list)
+    # True when the question named nothing Raft could tie to these
+    # conversations, so this is the shape of the dataset rather than an answer
+    # to what was asked.
+    is_overview: bool = False
+    suggestions: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_denominator(self) -> "Answer":

@@ -7,6 +7,7 @@ export function SettingsPage() {
   const client = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const aspects = useQuery({ queryKey: ["aspects"], queryFn: api.aspects });
+  const preflight = useQuery({ queryKey: ["preflight"], queryFn: api.preflight });
   const [traceCount, setTraceCount] = useState(847);
   const [seed, setSeed] = useState(20260821);
   const reset = useMutation({
@@ -59,6 +60,26 @@ export function SettingsPage() {
           </p>
         )}
       </section>
+
+      {preflight.data?.checked && (
+        <section className="settings-section">
+          <div className="section-heading">
+            <h2>Preflight</h2>
+            <span>Whether each workspace key can actually reach its configured models</span>
+          </div>
+          <div className="feature-list">
+            {(preflight.data.roles ?? []).map((row: any) => (
+              <div key={row.role}>
+                <span className="feature-icon">{row.ok ? <CheckCircle2 size={15} /> : <CircleDashed size={15} />}</span>
+                <div><strong>{row.role}</strong><p>{row.detail}</p></div>
+                <span className={row.ok ? "ready" : "pending"}>
+                  {row.ok ? "Reachable" : "Check this before demoing"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="settings-section">
         <div className="section-heading">

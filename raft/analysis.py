@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from collections import defaultdict
 from typing import Any
@@ -16,14 +17,16 @@ from raft.config import Settings
 from raft.dataset import DatasetIndex
 from raft.db import Database, utc_now
 from raft.judge import JUDGE_ID, SemanticAspectJudge, scope_text
-from raft.otari import OtariClient, OtariError, SandboxClient
+from raft.otari import OtariClient, OtariError, SandboxClient, embedding_backend
 from raft.query import (
     DIMENSIONS,
     METRICS,
     QuerySpec,
     QuestionCompiler,
     aggregation_code,
+    filter_catalog,
     format_metric,
+    predicate_by_id,
     spec_to_json,
 )
 from raft.redaction import verify_literal_quote
@@ -41,7 +44,12 @@ from raft.schemas import (
 )
 
 
+_ASPECT_TYPES = {"boolean", "category", "number"}
+
 MAX_GROUPS = 12
+# Focus cutoff, tuned in scripts/eval_focus.py against known intents.
+_FOCUS_FLOOR = 0.08
+_FOCUS_FRACTION_OF_PEAK = 0.20
 MAX_TRACE_GROUPS = 10
 
 
@@ -51,11 +59,39 @@ class AspectJudgment(BaseModel):
     evidence_quote: str
 
 
+class CategoryJudgment(BaseModel):
+    """A category aspect must answer with one of a fixed set of labels.
+
+    Free text cannot be grouped: "English", "english" and "en (English)" would
+    become three answers to one question.
+    """
+
+    label: str
+    confidence: float = Field(ge=0, le=1)
+    evidence_quote: str = ""
+
+
 class PlannerResult(BaseModel):
+    """What the planner may decide. Note what is absent: any SQL, any number.
+
+    The model chooses filters by id from a menu Raft supplies and Raft validates
+    every one, so interpreting "what do customers complain about" as "the user
+    ended frustrated" is a model judgment while the query stays Raft's.
+    """
+
     path: str
     explanation: str
+    filter_ids: list[str] = Field(default_factory=list)
+    focus: str = ""
+    group_by: str | None = None
+    metric: str | None = None
     aspect_question: str | None = None
     aspect_type: str | None = None
+    # For a category aspect: the closed set of answers, so results group.
+    aspect_labels: list[str] = Field(default_factory=list)
+    # The model may say the data cannot answer this at all.
+    unanswerable: bool = False
+    reason: str = ""
     tools_used: list[str] = Field(default_factory=list)
 
 
@@ -79,6 +115,7 @@ class AnalysisManager:
             use_bge=settings.raft_use_bge,
             bge_model=settings.raft_embedding_model,
             bge_revision=settings.raft_embedding_revision,
+            encoder_factory=lambda: embedding_backend(settings, self.otari.roles),
         )
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -100,6 +137,7 @@ class AnalysisManager:
         eligible, total = self.count_eligible(spec)
         if eligible == 0 and spec.predicates:
             eligible, total = self._relax(spec)
+        self._flag_if_unanswered(spec)
 
         plan = QuestionPlan(
             question=question,
@@ -126,11 +164,50 @@ class AnalysisManager:
                 question=spec.aspect_question or question,
                 type=spec.aspect_type,
                 created_from=question,
+                labels=list(getattr(spec, "aspect_labels", []) or []),
             )
             plan.estimate_usd = self._estimate_cost(eligible)
             seconds = self._estimate_seconds(eligible)
             plan.estimate_seconds_min, plan.estimate_seconds_max = seconds
         return plan
+
+    def _flag_if_unanswered(self, spec: QuerySpec) -> None:
+        """Mark an answer as an overview when the question was not used.
+
+        The clustering path already did this. A shape query did not, which is
+        how "which language do my clients speak?" became a breakdown by failure
+        mode: `language`, `clients` and `speak` were extracted and then dropped
+        on the floor, and nothing said so. The rule is the same on every path -
+        if content words survived compilation and neither a filter nor a
+        semantic focus consumed them, this is not an answer to the question.
+        """
+        if spec.broad:
+            return
+        leftover = [word for word in spec.focus_terms if word not in _QUESTION_FRAME]
+        if not leftover:
+            return
+        if spec.predicates or spec.path == "layer3_aspect":
+            return
+        if spec.path == "layer2_cluster":
+            # Clustering decides this later, once it has measured whether the
+            # focus separates the set.
+            return
+        spec.broad = True
+        # The compiled explanation claimed the question mapped cleanly to
+        # recorded columns. It did not, so that line must not stand.
+        spec.rationale = [line for line in spec.rationale if not line.startswith("Every part of this question")]
+        spec.rationale.append(
+            "Raft could not tie "
+            + ", ".join(f"“{word}”" for word in leftover[:4])
+            + " to anything these conversations record, so this is an overview rather than an answer to that "
+            "question."
+        )
+        if spec.metric == "traces":
+            # An overview should show what people actually talked about. A
+            # breakdown by failure mode is not a theme, and it carries no
+            # vocabulary to build follow-up suggestions from.
+            spec.path = "layer2_cluster"
+            spec.group_by = None
 
     def _relax(self, spec: QuerySpec) -> tuple[int, int]:
         """Drop the fewest filters needed to find anything, and say which.
@@ -177,7 +254,16 @@ class AnalysisManager:
         return self.count_eligible(spec)
 
     async def _consult_planner_model(self, spec: QuerySpec) -> None:
-        """Let the Otari planner override the compiled route when configured."""
+        """Let a model translate the question into Raft's own vocabulary.
+
+        This is the part a local heuristic cannot do. Nobody writes "I am
+        complaining" in a support chat - they write "this is going in circles" -
+        so matching a question's words against the traces finds nothing, and the
+        answer degenerates into the same dataset-wide grouping for every vaguely
+        worded question. A model bridges the wording; Raft still owns the query.
+        """
+        catalog = self.index.catalog
+        menu = filter_catalog(catalog)
         try:
             server_ids = (
                 [self.settings.otari_planner_mcp_server_id]
@@ -190,17 +276,51 @@ class AnalysisManager:
                     {
                         "role": "system",
                         "content": (
-                            "You route a question about a redacted LLM trace dataset. Use Raft's MCP tools to "
-                            "inspect the dataset. Choose layer1 when recorded shape columns answer it, "
-                            "layer2_cluster when the answer is in what people wrote, and layer3_aspect only when "
-                            "a new per-trace judgment is required. Raft has already compiled a candidate plan; "
-                            "keep it unless it is wrong."
+                            "You turn a question about a set of recorded LLM conversations into a query plan.\n"
+                            "Choose `path`: layer1 when recorded columns answer it, layer2_cluster when the answer "
+                            "is in what people wrote and the useful output is emergent themes, layer3_aspect when a "
+                            "new yes/no judgment of each conversation is required.\n"
+                            "Choose `filter_ids` ONLY from the supplied menu — these narrow which conversations are "
+                            "read. Translate intent: 'what do customers complain about' means conversations that "
+                            "ended badly, not the literal word 'complain'. Choose none if the question is about the "
+                            "whole dataset.\n"
+                            "Set `focus` to the subject words to match against conversation text, using vocabulary "
+                            "the conversations themselves would contain — not the asker's words. Empty if the "
+                            "question is dataset-wide.\n"
+                            "For layer3_aspect: write `aspect_question` as a question about ONE conversation. "
+                            "Set `aspect_type` to boolean for yes/no, number for a quantity, or category for an "
+                            "attribute with several possible answers (language, tone, topic). For category you MUST "
+                            "also give `aspect_labels`: 2-8 short labels covering the likely answers, because the "
+                            "results are grouped by them.\n"
+                            "Set `unanswerable` true with a `reason` when these conversations simply do not record "
+                            "what is being asked — that is a better answer than a plausible wrong one.\n"
+                            "`group_by` and `metric` only for layer1. Never invent ids. Never return counts.\n\n"
+                            "Worked examples:\n"
+                            "Q: what do customers complain about?\n"
+                            "A: layer2_cluster; filter_ids the ones meaning the user ended badly; focus written in the "
+                            "conversations' words (\"refund delay broken charge cancel\"), not the word complain.\n"
+                            "Q: which language do my clients speak?\n"
+                            "A: layer3_aspect; aspect_type category; aspect_question \"What language is this "
+                            "conversation written in?\"; aspect_labels [English, Spanish, French, German, Other]. "
+                            "No column records language, so it must be judged per conversation.\n"
+                            "Q: what should I fix first?\n"
+                            "A: layer2_cluster; filter to conversations that went wrong, because nothing needs fixing "
+                            "in the ones that worked; no focus.\n"
+                            "Q: which app costs the most?\n"
+                            "A: layer1; group_by app; metric cost; no filters."
                         ),
                     },
                     {
                         "role": "user",
                         "content": json.dumps(
-                            {"question": spec.question, "compiled_plan": json.loads(spec_to_json(spec))}
+                            {
+                                "question": spec.question,
+                                "available_filters": menu,
+                                "available_group_by": sorted(DIMENSIONS),
+                                "available_metrics": sorted(METRICS),
+                                "dataset": self.dataset_brief(),
+                                "rafts_own_guess": json.loads(spec_to_json(spec)),
+                            }
                         ),
                     },
                 ],
@@ -216,20 +336,101 @@ class AnalysisManager:
                     completion.request_id,
                     "Planner reported using: " + ", ".join(parsed.tools_used),
                 )
-            if parsed.path in ("layer1", "layer2_cluster", "layer3_aspect"):
-                if parsed.path != spec.path:
-                    spec.rationale.append(
-                        f"The Otari planner re-routed this from {spec.path} to {parsed.path}: {parsed.explanation}"
-                    )
-                spec.path = parsed.path  # type: ignore[assignment]
-            if parsed.path == "layer3_aspect":
-                spec.aspect_question = parsed.aspect_question or spec.aspect_question or spec.question
-                spec.aspect_type = parsed.aspect_type or "boolean"
+            self._apply_planner_result(spec, parsed)
             spec.planner_mode = "otari_mcp"  # type: ignore[attr-defined]
             spec.inspected_tools = parsed.tools_used  # type: ignore[attr-defined]
         except OtariError as error:
-            # The compiled plan already stands on its own; Settings shows the failure.
-            spec.rationale.append(f"The Otari planner was unavailable ({error}); Raft used its own compiled plan.")
+            spec.rationale.append(
+                f"The model planner was unavailable ({error}); Raft used its own compiled plan, which matches "
+                "wording literally and may miss a paraphrase."
+            )
+
+    def _apply_planner_result(self, spec: QuerySpec, parsed: PlannerResult) -> None:
+        """Adopt only what validates. An unknown id is dropped, never executed."""
+        catalog = self.index.catalog
+        chosen: list = []
+        rejected: list[str] = []
+        for identifier in parsed.filter_ids[:6]:
+            predicate = predicate_by_id(catalog, identifier)
+            if predicate is None:
+                rejected.append(identifier)
+                continue
+            if not any(item.sql == predicate.sql for item in chosen):
+                chosen.append(predicate)
+
+        if chosen:
+            spec.predicates = chosen
+            spec.rationale.append(
+                "The planner read this as: " + " and ".join(f"“{item.label}”" for item in chosen) + "."
+            )
+        elif parsed.filter_ids:
+            spec.rationale.append("The planner proposed no filter Raft recognises, so the question was left broad.")
+        if rejected:
+            spec.rationale.append("Ignored unrecognised filter ids: " + ", ".join(rejected[:4]) + ".")
+
+        if parsed.unanswerable:
+            spec.broad = True
+            spec.rationale.append(
+                "The planner judged that these conversations cannot answer this question"
+                + (f": {parsed.reason}" if parsed.reason else ".")
+            )
+        if parsed.path in ("layer1", "layer2_cluster", "layer3_aspect"):
+            if parsed.path != spec.path:
+                spec.rationale = [
+                    line for line in spec.rationale if not line.startswith(("Every part of this question", "This asks about"))
+                ]
+                spec.rationale.append(f"Re-routed from {spec.path} to {parsed.path}: {parsed.explanation}")
+            spec.path = parsed.path  # type: ignore[assignment]
+
+        if parsed.focus.strip():
+            spec.focus = parsed.focus.strip()
+            spec.focus_terms = [word for word in spec.focus.split() if len(word) > 2]
+            spec.rationale.append(f"Searching the conversations for: “{spec.focus}”.")
+
+        if spec.path == "layer1":
+            if parsed.group_by in DIMENSIONS:
+                spec.group_by = parsed.group_by
+            if parsed.metric in METRICS:
+                spec.metric = parsed.metric
+                spec.aggregate = "count" if parsed.metric == "traces" else spec.aggregate
+        else:
+            spec.group_by = None
+
+        if spec.path == "layer3_aspect":
+            spec.aspect_question = parsed.aspect_question or spec.aspect_question or spec.question
+            spec.aspect_type = parsed.aspect_type if parsed.aspect_type in _ASPECT_TYPES else "boolean"
+            if spec.aspect_type == "category":
+                labels = [label.strip() for label in parsed.aspect_labels if label.strip()][:8]
+                if len(labels) >= 2:
+                    spec.aspect_labels = labels  # type: ignore[attr-defined]
+                else:
+                    # A category with no usable answer set cannot be grouped.
+                    spec.aspect_type = "boolean"
+                    spec.rationale.append(
+                        "The planner asked for a category but gave no answer set, so this was evaluated as yes/no."
+                    )
+
+    def dataset_brief(self) -> dict[str, Any]:
+        """A compact description of what is actually in the store."""
+        return {
+            "conversations": self.db.trace_count(),
+            "apps": [row["key"] for row in self.db.fetch_all(
+                "SELECT app AS key, COUNT(*) AS c FROM traces GROUP BY app ORDER BY c DESC"
+            )],
+            "outcomes": self.db.fetch_all(
+                "SELECT outcome AS key, COUNT(*) AS count FROM traces GROUP BY outcome ORDER BY count DESC"
+            ),
+            "failure_modes": self.db.fetch_all(
+                "SELECT failure_mode AS key, COUNT(*) AS count FROM traces GROUP BY failure_mode ORDER BY count DESC"
+            ),
+            "tools": [row["key"] for row in self.db.fetch_all(
+                "SELECT tool AS key, COUNT(*) AS c FROM trace_tools GROUP BY tool ORDER BY c DESC LIMIT 20"
+            )],
+            "example_requests": [
+                row["user_request"]
+                for row in self.db.fetch_all("SELECT user_request FROM traces ORDER BY id LIMIT 12")
+            ],
+        }
 
     def _parent_spec(self, parent_run_id: str | None) -> dict[str, Any] | None:
         if not parent_run_id:
@@ -273,6 +474,8 @@ class AnalysisManager:
             "aspect_question": spec.aspect_question,
             "aspect_type": spec.aspect_type,
             "limit": spec.limit,
+            "broad": spec.broad,
+            "aspect_labels": list(getattr(spec, "aspect_labels", []) or []),
             "rationale": spec.rationale,
             "predicates": [
                 {"field": item.field, "sql": item.sql, "params": list(item.params), "label": item.label}
@@ -294,6 +497,8 @@ class AnalysisManager:
         spec.aspect_question = raw.get("aspect_question")
         spec.aspect_type = raw.get("aspect_type", "boolean")
         spec.limit = raw.get("limit", 8)
+        spec.broad = bool(raw.get("broad", False))
+        spec.aspect_labels = raw.get("aspect_labels", [])  # type: ignore[attr-defined]
         spec.rationale = raw.get("rationale", [])
         spec.predicates = [
             Predicate(item["field"], item["sql"], tuple(item["params"]), item["label"])
@@ -325,7 +530,12 @@ class AnalysisManager:
             per_trace = 0.0012  # measured local judge throughput
             base = max(1.0, eligible * per_trace)
             return int(base), int(base * 2.5) + 2
-        return max(10, int(eligible * 0.045)), max(20, int(eligible * 0.075))
+        # Measured against this gateway: 847 conversations took 157s at a
+        # concurrency of 12, i.e. ~5.4/s. Scale by the configured concurrency
+        # and keep a wide upper bound, because hosted latency varies a lot.
+        per_second = 5.4 * (self.settings.raft_aspect_concurrency / 12)
+        base = eligible / max(per_second, 1.0)
+        return max(5, int(base * 0.7)), max(15, int(base * 1.8))
 
     # ------------------------------------------------------------------
     # Runs
@@ -380,8 +590,17 @@ class AnalysisManager:
             return str(existing["id"])
         aspect_id = f"asp_{uuid.uuid4().hex[:10]}_v1"
         self.db.execute(
-            "INSERT INTO aspects(id,question,type,created_from,version,created_at) VALUES(?,?,?,?,?,?)",
-            (aspect_id, aspect.question, aspect.type, aspect.created_from, 1, utc_now()),
+            "INSERT INTO aspects(id,question,type,labels_json,created_from,version,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                aspect_id,
+                aspect.question,
+                aspect.type,
+                json.dumps(aspect.labels),
+                aspect.created_from,
+                1,
+                utc_now(),
+            ),
         )
         return aspect_id
 
@@ -524,21 +743,27 @@ class AnalysisManager:
         # terms that are both in the corpus and reasonably specific can do that;
         # narrowing on a word like "asking" would shrink the answer set for no
         # reason and make the shares meaningless.
-        topical = self._topical_query(spec)
-        if topical:
-            ranked = self.index.rank(topical, trace_ids)
-            strong = [trace_id for trace_id, score in ranked if score >= 0.12]
-            floor = max(20, int(len(trace_ids) * 0.15))
-            if floor <= len(strong) < len(trace_ids):
-                trace_ids = sorted(strong)
-                notes.append(
-                    f"Narrowed to the {len(trace_ids):,} conversations related to “{topical}” "
-                    "(cosine ≥ 0.12 in the local embedding space)."
+        # Planning already decided this question names nothing these
+        # conversations record. Narrowing on its leftover words would pick up
+        # incidental matches and present eight traces as the answer.
+        topical = "" if spec.broad else self._topical_query(spec)
+        trace_ids, focus_note = self.focus_on_question(topical, trace_ids)
+        if focus_note:
+            notes.append(focus_note)
+            spec.rationale.append(focus_note)
+        else:
+            spec.broad = spec.broad or not spec.predicates
+            note = (
+                (
+                    f"Nothing in “{spec.question}” matches the words these conversations actually use, so Raft "
+                    "could not narrow to a subject. What follows is the shape of the whole dataset — use a "
+                    "suggestion below to ask something it can pin down."
                 )
-            elif strong:
-                notes.append(
-                    f"“{topical}” did not separate this set cleanly, so every matching conversation was clustered."
-                )
+                if spec.broad
+                else "The wording did not single out any part of this set, so every matching conversation was grouped."
+            )
+            notes.append(note)
+            spec.rationale.append(note)
 
         # Grouping runs over what the person asked plus which tools were
         # involved. Including the agent's prose measurably degrades the groups -
@@ -574,8 +799,17 @@ class AnalysisManager:
             named = await self._name_clusters_with_model(clusters, trace_ids, record_by_id)
             if named:
                 names.update(named[0])
-                interpretation = named[1]
-                notes.append("Cluster names rewritten by the Otari cluster-namer model; counts unchanged.")
+            else:
+                notes.append(
+                    f"The cluster-namer model did not answer within "
+                    f"{self.settings.otari_naming_timeout_seconds:.0f}s, so groups keep the name of the request "
+                    "made by the conversation nearest each centre."
+                )
+                # Only the names are taken. The model's own summary sentence is
+                # written without seeing a single count, so it reads as
+                # "these clusters represent various topics" - Raft's own
+                # interpretation is composed from the numbers that were computed.
+                notes.append("Group names written by the cluster-namer model; counts and shares unchanged.")
 
         rows = [
             {"trace_id": trace_ids[position], "group": str(int(label)), "value": 1.0, "eligible": True}
@@ -597,24 +831,82 @@ class AnalysisManager:
         )
 
     def _topical_query(self, spec: QuerySpec) -> str:
-        """The part of the question that names a subject the corpus knows about."""
+        """Everything in the question that names a subject.
+
+        This used to demand two terms of IDF >= 4, which almost nothing clears,
+        so for most questions the wording was captured and then dropped - and a
+        question with no recognised filter word became a clustering of the whole
+        dataset, identical no matter what was typed. Any content word the corpus
+        knows now counts; whether it is worth narrowing on is decided by
+        measuring the result, not by a threshold on the query.
+        """
         index = self.index.index
         if index is None:
             return ""
-        weights = index.lexical(" ".join(spec.focus_terms))
+        source = spec.focus or spec.question
+        weights = index.lexical(source)
         if not weights:
             return ""
-        specific = [
+        terms = [
             (float(index.idf[position]), index.reverse_vocabulary[position])
-            for position in sorted(weights, key=lambda item: -weights[item])
+            for position in weights
             if "_" not in index.reverse_vocabulary[position]
+            and index.reverse_vocabulary[position] not in _QUESTION_FRAME
         ]
-        # Narrowing throws conversations out of the denominator, so it has to be
-        # earned: either several fairly rare words, or one very rare one.
-        strong = [term for score, term in specific if score >= 4.0]
-        if len(strong) >= 2 or any(score >= 5.5 for score, _ in specific):
-            return " ".join(term.replace("_", " ") for term in strong[:5])
-        return ""
+        terms.sort(reverse=True)
+        kept = [term for _, term in terms[:8]]
+        if spec.focus:
+            # A focus written by the planner is already in the corpus's own
+            # vocabulary. Dropping the words this index has not seen would throw
+            # away most of it, so those are kept - they cost nothing to score
+            # and they matter if the dataset is later rebuilt.
+            unseen = [
+                word
+                for word in spec.focus.split()
+                if len(word) > 2 and word.casefold() not in _QUESTION_FRAME and word not in kept
+            ]
+            kept.extend(unseen[:8])
+        return " ".join(kept)
+
+    def focus_on_question(
+        self, question: str, trace_ids: list[str]
+    ) -> tuple[list[str], str | None]:
+        """Keep the conversations this question is actually about.
+
+        Narrowing is justified only when the question separates the set: if the
+        best matches score far above the middle of the distribution, those are
+        the conversations being asked about. If everything scores alike the
+        question is genuinely dataset-wide ("what are the main themes"), and the
+        whole set is the right answer - which is said out loud rather than
+        looking like the question was ignored.
+        """
+        if not question or len(trace_ids) < 25:
+            return trace_ids, None
+        ranked = self.index.rank(question, trace_ids)
+        if not ranked:
+            return trace_ids, None
+        scores = np.array([score for _, score in ranked], dtype=np.float32)
+        peak = float(np.mean(scores[: max(3, len(scores) // 50)]))
+        median = float(np.median(scores))
+        if peak < 0.08 or peak <= median * 1.6:
+            return trace_ids, None
+
+        # Tuned against the corpus's own intent labels: this keeps essentially
+        # every on-topic conversation while holding precision highest of the
+        # cutoffs tried. A stricter cut kept a handful of near-duplicates and
+        # threw away the rest of the topic.
+        cutoff = max(_FOCUS_FLOOR, _FOCUS_FRACTION_OF_PEAK * peak)
+        kept = [trace_id for trace_id, score in ranked if score >= cutoff]
+        # Small is a legitimate answer: "only 3 conversations are about this" is
+        # information, and on a small dataset a real subject may only have a
+        # handful. The floor exists only to stop a one-trace "theme".
+        floor = max(3, int(len(trace_ids) * 0.01))
+        if not floor <= len(kept) <= int(len(trace_ids) * 0.85):
+            return trace_ids, None
+        return sorted(kept), (
+            f"Narrowed to the {len(kept):,} conversations this question is about "
+            f"(cosine ≥ {cutoff:.2f} against “{question}”), out of {len(trace_ids):,} that matched its filters."
+        )
 
     @staticmethod
     def _centroid_ranks(vectors, labels, centers, trace_ids: list[str]) -> dict[str, float]:
@@ -628,14 +920,22 @@ class AnalysisManager:
         }
 
     async def _name_clusters_with_model(self, clusters, trace_ids, record_by_id):
+        # Only the groups the answer actually shows are worth naming, and the
+        # model needs a couple of short examples, not five long ones. Sending
+        # every cluster in full took over a minute; this is the same output in
+        # about ten seconds.
+        largest = sorted(clusters, key=lambda cluster: -len(cluster.members))[:MAX_GROUPS]
         try:
             payload = [
                 {
                     "cluster": cluster.key,
-                    "examples": [record_by_id[trace_ids[member]]["user_request"] for member in cluster.members[:5]],
-                    "distinctive_terms": cluster.terms,
+                    "examples": [
+                        record_by_id[trace_ids[member]]["user_request"][:140]
+                        for member in cluster.members[:3]
+                    ],
+                    "distinctive_terms": cluster.terms[:4],
                 }
-                for cluster in clusters
+                for cluster in largest
             ]
             _, parsed = await self.otari.complete(
                 "cluster_namer",
@@ -650,10 +950,13 @@ class AnalysisManager:
                     {"role": "user", "content": json.dumps(payload)},
                 ],
                 response_schema=ClusterNamingResult,
+                timeout=self.settings.otari_naming_timeout_seconds,
             )
             if parsed:
                 return parsed.names, parsed.interpretation
-        except OtariError:
+        except Exception:  # noqa: BLE001 - naming is decoration; counts stand alone
+            # Group names are cosmetic: Raft already has a name for every group
+            # from its own members. Nothing here is worth failing a run over.
             return None
         return None
 
@@ -695,8 +998,12 @@ class AnalysisManager:
             try:
                 notes = await self._evaluate_aspect_live(run_id, aspect, pending, record_by_id, len(trace_ids))
             except OtariError as error:
-                # On stage, a gateway hiccup must not end the run. Finish the
-                # remaining rows locally and say plainly that it happened.
+                # A gateway hiccup must not end the run, but it must not corrupt
+                # the answer either. The local judge only decides yes/no, so
+                # using it to finish a category run mixes "English" rows with
+                # "yes" rows and produces a total that means nothing. For a
+                # typed aspect the honest move is to answer over what was
+                # actually judged and declare the rest excluded.
                 self.db.update_run(run_id, error=None)
                 remaining = [
                     trace_id
@@ -706,8 +1013,16 @@ class AnalysisManager:
                         (aspect["id"], trace_id),
                     )
                 ]
-                notes = [f"Otari was unavailable partway through ({error}); Raft finished locally."]
-                notes += self._evaluate_aspect_locally(run_id, aspect, remaining, trace_ids)
+                if aspect["type"] == "boolean":
+                    notes = [f"Otari became unavailable partway through ({error}); Raft finished locally."]
+                    notes += self._evaluate_aspect_locally(run_id, aspect, remaining, trace_ids)
+                else:
+                    notes = [
+                        f"Otari became unavailable after judging {len(trace_ids) - len(remaining):,} of "
+                        f"{len(trace_ids):,} conversations ({error}).",
+                        f"The remaining {len(remaining):,} are excluded rather than guessed — this answer's "
+                        "denominator is the judged set only. Resume the run to finish them.",
+                    ]
             else:
                 if self.db.get_run(run_id)["status"] == "paused_budget":  # type: ignore[index]
                     return
@@ -734,8 +1049,8 @@ class AnalysisManager:
             rows.append(
                 {
                     "trace_id": value["trace_id"],
-                    "group": "yes" if decoded is True else "no" if decoded is False else str(decoded),
-                    "value": 1.0,
+                    "group": _aspect_group(decoded),
+                    "value": float(decoded) if isinstance(decoded, (int, float)) and not isinstance(decoded, bool) else 1.0,
                     "eligible": True,
                 }
             )
@@ -758,7 +1073,11 @@ class AnalysisManager:
             method_notes=notes,
             sql=sql,
             sql_params=list(params),
-            names={"yes": "Yes", "no": "No"},
+            names=(
+                {"yes": "Yes", "no": "No"}
+                if aspect["type"] == "boolean"
+                else {}  # a category groups under its own labels
+            ),
             aspect_quotes=quotes,
             rank_hint=confidence_rank,
         )
@@ -869,80 +1188,75 @@ class AnalysisManager:
         record_by_id: dict[str, Any],
         total: int,
     ) -> list[str]:
+        """One model call per conversation, several in flight at once.
+
+        This used to run strictly in series. Over eight hundred conversations
+        that is minutes of dead air, which is unusable in front of anyone, so
+        calls are issued under a semaphore and results are written as they land.
+        Everything else is preserved: each row is persisted on its own, a
+        budget 403 pauses the run resumably, and a guardrail block quarantines
+        that trace instead of failing.
+        """
         role = self.otari.role("aspect_evaluator")
+        labels = json.loads(aspect.get("labels_json") or "[]")
+        kind = aspect["type"]
         spent = sum(
             float(row["cost_usd"])
             for row in self.db.fetch_all(
                 "SELECT cost_usd FROM aspect_values WHERE aspect_id=?", (aspect["id"],)
             )
         )
-        routing_note = ""
+        allowance = self.settings.raft_local_run_allowance_usd
         done = total - len(pending)
-        for offset, trace_id in enumerate(pending):
-            if spent >= self.settings.raft_local_run_allowance_usd:
-                self.db.update_run(
-                    run_id,
-                    status="paused_budget",
-                    completed=done + offset,
-                    message="Paused before Raft's local run allowance was exceeded.",
-                )
-                return []
-            record = record_by_id[trace_id]
-            try:
-                completion, judgment = await self.otari.complete(
-                    "aspect_evaluator",
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Evaluate exactly one redacted conversation against the aspect question. Return a "
-                                "typed value, a confidence, and an evidence quote copied verbatim from the input."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "aspect": aspect["question"],
-                                    "user_request": record["user_request"],
-                                    "summary": record["summary"],
-                                }
-                            ),
-                        },
-                    ],
-                    response_schema=AspectJudgment,
-                )
-                assert judgment
-                source = f"{record['user_request']}\n{record['summary']}"
-                quote = judgment.evidence_quote if verify_literal_quote(judgment.evidence_quote, source) else ""
-                item_cost = self.otari._usage_cost(completion.usage) or 0.00007
-                if completion.model and completion.model != role.primary:
-                    routing_note = f" · Routing fallback: {role.primary} → {completion.model}"
-                spent += item_cost
-                self.db.execute(
-                    """
-                    INSERT OR REPLACE INTO aspect_values(
-                      trace_id,aspect_id,value_json,confidence,model_id,prompt_version,status,cost_usd,
-                      request_id,score,evidence_quote
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        trace_id,
-                        aspect["id"],
-                        json.dumps(judgment.value),
-                        judgment.confidence,
-                        completion.model or role.primary,
-                        "aspect-v1",
-                        "complete",
-                        item_cost,
-                        completion.request_id,
-                        None,
-                        quote,
-                    ),
-                )
-            except OtariError as error:
-                if error.status_code == 403 and "guardrail" in str(error).casefold():
-                    self.db.execute("UPDATE traces SET guardrail_status='blocked' WHERE id=?", (trace_id,))
+        started = time.perf_counter()
+
+        # Check headroom before spending anything, not after the first call.
+        # A run that starts with no allowance left must pause having cost zero.
+        if pending and spent >= allowance:
+            self.db.update_run(
+                run_id,
+                status="paused_budget",
+                completed=done,
+                message="Paused before Raft's local run allowance was exceeded.",
+            )
+            return []
+
+        state: dict[str, Any] = {
+            "spent": spent,
+            "completed": 0,
+            "routing_note": "",
+            "paused": None,
+            "stop": False,
+        }
+        lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(max(1, self.settings.raft_aspect_concurrency))
+
+        async def evaluate(trace_id: str) -> None:
+            if state["stop"]:
+                return
+            async with semaphore:
+                if state["stop"]:
+                    return
+                record = record_by_id[trace_id]
+                try:
+                    completion, judgment = await self.otari.complete(
+                        "aspect_evaluator",
+                        self._aspect_messages(aspect["question"], kind, labels, record),
+                        response_schema=CategoryJudgment if kind == "category" else AspectJudgment,
+                    )
+                    assert judgment
+                    value, confidence, raw_quote = self._decode_judgment(judgment, kind, labels)
+                    source = f"{record['user_request']}\n{record['summary']}"
+                    quote = raw_quote if verify_literal_quote(raw_quote, source) else ""
+                    item_cost = self.otari._usage_cost(completion.usage) or 0.00007
+                    async with lock:
+                        state["spent"] += item_cost
+                        state["completed"] += 1
+                        if completion.model and completion.model != role.primary:
+                            state["routing_note"] = f" · Routing fallback: {role.primary} → {completion.model}"
+                        if state["spent"] >= allowance:
+                            state["stop"] = True
+                            state["paused"] = "Paused before Raft's local run allowance was exceeded."
                     self.db.execute(
                         """
                         INSERT OR REPLACE INTO aspect_values(
@@ -950,36 +1264,131 @@ class AnalysisManager:
                           request_id,score,evidence_quote
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                         """,
-                        (trace_id, aspect["id"], "null", 0, role.primary, "aspect-v1", "guardrail_blocked", 0, error.request_id, None, ""),
+                        (
+                            trace_id,
+                            aspect["id"],
+                            json.dumps(value),
+                            confidence,
+                            completion.model or role.primary,
+                            "aspect-v2",
+                            "complete",
+                            item_cost,
+                            completion.request_id,
+                            None,
+                            quote,
+                        ),
                     )
-                    continue
-                if error.status_code == 403:
-                    self.db.record_feature(
-                        "Budgets",
-                        "live_403_pause_observed_log_pending",
-                        error.request_id,
-                        f"Aspect run paused on Otari HTTP 403 after {done + offset} completed rows: {error}",
-                    )
+                except OtariError as error:
+                    if error.status_code == 403 and "guardrail" in str(error).casefold():
+                        self.db.execute("UPDATE traces SET guardrail_status='blocked' WHERE id=?", (trace_id,))
+                        self.db.execute(
+                            """
+                            INSERT OR REPLACE INTO aspect_values(
+                              trace_id,aspect_id,value_json,confidence,model_id,prompt_version,status,cost_usd,
+                              request_id,score,evidence_quote
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (trace_id, aspect["id"], "null", 0, role.primary, "aspect-v2", "guardrail_blocked", 0, error.request_id, None, ""),
+                        )
+                        return
+                    if error.status_code == 403:
+                        async with lock:
+                            state["stop"] = True
+                            state["paused"] = "Otari budget headroom was exhausted. Increase the cap, then resume."
+                        self.db.record_feature(
+                            "Budgets",
+                            "live_403_pause_observed_log_pending",
+                            error.request_id,
+                            f"Aspect run paused on Otari HTTP 403: {error}",
+                        )
+                        return
+                    raise
+
+        async def report() -> None:
+            """Progress comes from completions, not from the loop index."""
+            while not state["stop"]:
+                await asyncio.sleep(0.4)
+                completed = int(state["completed"])
+                if completed:
                     self.db.update_run(
                         run_id,
-                        status="paused_budget",
-                        completed=done + offset,
-                        message="Otari budget headroom was exhausted. Increase the cap, then resume.",
-                        error=str(error),
+                        completed=done + completed,
+                        message=f"Evaluated {done + completed:,} of {total:,} conversations{state['routing_note']}",
                     )
-                    return []
-                raise
-            if offset % 20 == 0 or offset == len(pending) - 1:
-                self.db.update_run(
-                    run_id,
-                    completed=done + offset + 1,
-                    message=f"Evaluated {done + offset + 1:,} of {total:,} conversations{routing_note}",
-                )
-                await asyncio.sleep(0)
+
+        reporter = asyncio.create_task(report())
+        try:
+            await asyncio.gather(*(evaluate(trace_id) for trace_id in pending))
+        finally:
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
+
+        elapsed = time.perf_counter() - started
+        if state["paused"]:
+            self.db.update_run(
+                run_id,
+                status="paused_budget",
+                completed=done + int(state["completed"]),
+                message=str(state["paused"]),
+            )
+            return []
+        self.db.update_run(run_id, completed=total, message="Aspect evaluation complete")
         return [
-            f"Aspect evaluated through Otari with {role.primary} (fallback {', '.join(role.fallbacks)}).",
-            f"Local run allowance ${self.settings.raft_local_run_allowance_usd:.2f}; spent ${spent:.4f}.",
+            f"Evaluated by {role.primary} through Otari, {self.settings.raft_aspect_concurrency} calls in flight.",
+            f"{int(state['completed']):,} conversations judged in {elapsed:.1f}s; spent ${state['spent']:.4f} "
+            f"of the ${allowance:.2f} run allowance.",
+        ] + ([f"Answer set: {', '.join(labels)}."] if labels else [])
+
+    @staticmethod
+    def _aspect_messages(
+        question: str, kind: str, labels: list[str], record: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        if kind == "category":
+            instruction = (
+                "Read one redacted conversation and answer the question with exactly one label from the allowed "
+                "list. If none applies, answer with the closest one. Quote a short phrase from the input as "
+                "evidence, copied verbatim."
+            )
+            payload = {
+                "question": question,
+                "allowed_labels": labels,
+                "user_request": record["user_request"],
+                "summary": record["summary"],
+            }
+        else:
+            instruction = (
+                "Evaluate exactly one redacted conversation against the question. Return a typed value, a "
+                "confidence, and an evidence quote copied verbatim from the input."
+            )
+            payload = {
+                "question": question,
+                "user_request": record["user_request"],
+                "summary": record["summary"],
+            }
+        return [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": json.dumps(payload)},
         ]
+
+    @staticmethod
+    def _decode_judgment(judgment: Any, kind: str, labels: list[str]) -> tuple[Any, float, str]:
+        """Coerce the model's answer into something groupable."""
+        if kind == "category":
+            label = str(getattr(judgment, "label", "")).strip()
+            if labels:
+                match = next((option for option in labels if option.casefold() == label.casefold()), None)
+                # An answer outside the agreed set would create a group of one.
+                label = match or "other"
+            return label or "unknown", float(judgment.confidence), getattr(judgment, "evidence_quote", "")
+        value = judgment.value
+        if kind == "number":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = 0.0
+        elif kind == "boolean" and not isinstance(value, bool):
+            value = str(value).strip().casefold() in {"true", "yes", "1"}
+        return value, float(judgment.confidence), judgment.evidence_quote
 
     # ------------------------------------------------------------------
     # Shared answer assembly
@@ -1064,14 +1473,16 @@ class AnalysisManager:
             spec=self.serialize_spec(spec),
             follow_ups=self._follow_ups(spec, groups),
             standouts=self.find_standouts(groups, denominator),
+            is_overview=bool(getattr(spec, "broad", False)),
+            suggestions=self._suggestions(groups),
         )
         self.db.update_run(run_id, status="synthesizing", message="Linking literal evidence")
         self.db.execute(
             """
             INSERT INTO answers(
               id,run_id,question,path,denominator,excluded_count,groups_json,interpretation,
-              evidence_json,work_json,aspect_id,spec_json,headline,metric,unit,follow_ups_json,standouts_json,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              evidence_json,work_json,aspect_id,spec_json,headline,metric,unit,follow_ups_json,standouts_json,is_overview,suggestions_json,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 answer.id,
@@ -1091,6 +1502,8 @@ class AnalysisManager:
                 answer.unit,
                 json.dumps(answer.follow_ups),
                 json.dumps([item.model_dump() for item in answer.standouts]),
+                int(answer.is_overview),
+                json.dumps(answer.suggestions),
                 utc_now(),
             ),
         )
@@ -1122,8 +1535,11 @@ class AnalysisManager:
         unit: str,
         spec: QuerySpec,
     ) -> list[AnswerGroup]:
-        if {"yes", "no"} <= {str(item["key"]) for item in raw_groups}:
+        keys = {str(item["key"]) for item in raw_groups}
+        if {"yes", "no"} <= keys and keys <= {"yes", "no", "unknown"}:
             # A boolean aspect reads as "yes first", whichever side is larger.
+            # Only when the answer really is boolean - a category run that
+            # happens to contain a "yes" label must stay ranked by size.
             raw_groups = sorted(raw_groups, key=lambda item: 0 if str(item["key"]) == "yes" else 1)
         limit = MAX_TRACE_GROUPS if spec.group_by == "trace" else MAX_GROUPS
         head = raw_groups[:limit]
@@ -1385,7 +1801,11 @@ class AnalysisManager:
             return f"{format_metric(float(result['value_sum']), unit)} of {metric_name} across {denominator:,} conversations"
         top = groups[0] if groups else None
         if top:
-            return f"{top.label} — {top.count:,} of {denominator:,} ({top.share * 100:.1f}%)"
+            lead = f"{top.label} — {top.count:,} of {denominator:,} ({top.share * 100:.1f}%)"
+            if getattr(spec, "broad", False):
+                # This is the shape of the dataset, not a reply to the question.
+                return f"Overview of {denominator:,} conversations · biggest theme: {lead}"
+            return lead
         return f"{denominator:,} conversations"
 
     def _interpretation(
@@ -1528,6 +1948,61 @@ class AnalysisManager:
                         )
                     )
         return evidence
+
+    def _suggestions(self, groups: list[AnswerGroup]) -> list[str]:
+        """Questions built out of the data's own words, so they will land.
+
+        A broad question cannot be narrowed by matching its wording, but the
+        groups Raft just built are described in vocabulary the conversations
+        really contain. Offering those back turns a dead end into one click.
+        """
+        offers: list[str] = []
+        for group in groups:
+            if group.key == "__other__" or not group.terms:
+                continue
+            _ = group
+            subject = self._subject_of(group.terms)
+            if not subject:
+                continue
+            profile = group.profile
+            if profile and profile.top_failure and profile.top_failure_count >= max(3, group.count // 3):
+                offers.append(f"Why do conversations about {subject} go wrong?")
+            else:
+                offers.append(f"What happens when people ask about {subject}?")
+            if len(offers) >= 5:
+                break
+        if offers:
+            return offers
+        # Grouped answers (failure modes, apps) carry no wording of their own,
+        # so fall back to the subjects the dataset is actually made of.
+        return [
+            f"What happens when people {row['key'][0].lower() + row['key'][1:]}?"
+            for row in self.db.fetch_all(
+                "SELECT intent_label AS key, COUNT(*) AS c FROM traces WHERE intent_label != '' "
+                "GROUP BY intent_label ORDER BY c DESC LIMIT 5"
+            )
+        ]
+
+    def _subject_of(self, terms: list[str]) -> str:
+        """The most distinctive phrase in a group, judged by its rarest word.
+
+        The top class-TF-IDF term is sometimes a pair like "still not", which
+        names nothing and produces a suggestion no one would click. Ranking by
+        the rarest word in each phrase picks the one that actually identifies a
+        subject.
+        """
+        index = self.index.index
+        if index is None:
+            return ""
+        best, best_score = "", 0.0
+        for term in terms[:6]:
+            weights = index.lexical(term)
+            if not weights:
+                continue
+            rarest = min(float(index.idf[position]) for position in weights)
+            if rarest > best_score:
+                best, best_score = term, rarest
+        return best if best_score >= 3.5 else ""
 
     def _follow_ups(self, spec: QuerySpec, groups: list[AnswerGroup]) -> list[str]:
         suggestions: list[str] = []
@@ -1726,6 +2201,32 @@ ERROR_REFERENCE: dict[str, str] = {
 
 
 # Enum values whose bare name would mislead in an answer.
+# Words that shape a question without naming its subject. Keeping them would
+# make "what do users complain about" match on "user" rather than "complain".
+_QUESTION_FRAME = frozenset(
+    """
+    agent agents assistant bot llm model user users customer customers people conversation
+    conversations trace traces chat chats thing things stuff data set dataset product app
+    ask asks asked asking tell show give get got want need see know think say says main
+    biggest most least top first last good bad better worse improve fix wrong right issue
+    issues problem problems question questions summarise summarize summary overview
+    """.split()
+)
+
+# Attributes of a conversation rather than subjects of one. "What tone do users
+# write in?" is a property of every conversation, so matching the word "write"
+# against the text finds whichever traces happen to contain it - a real subject
+# like "medical device" scores *lower* than that noise, so no similarity
+# threshold can separate them. A model routes these to a category aspect; here
+# they are refused as topics so the answer is honestly an overview instead.
+_CONVERSATION_ATTRIBUTES = frozenset(
+    """
+    language languages tone tones sentiment mood style wording phrasing politeness
+    speak speaks speaking spoken write writes writing written word words voice
+    """.split()
+)
+_QUESTION_FRAME = _QUESTION_FRAME | _CONVERSATION_ATTRIBUTES
+
 ENUM_LABELS = {
     "none": "No mechanical failure",
     "unknown": "Not recorded",
@@ -1745,6 +2246,19 @@ ENUM_LABELS = {
 # Identifiers must be shown exactly as they are; prettifying a model id makes it
 # impossible to match against a routing policy or a request-cost lookup.
 _VERBATIM_DIMENSIONS = frozenset({"model", "provider", "app", "tool", "error_code", "day", "week", "hour"})
+
+
+def _aspect_group(value: Any) -> str:
+    """The group key for one aspect answer, whatever its type."""
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    if value is None:
+        return "unknown"
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return str(value).strip() or "unknown"
 
 
 def _humanise(key: str, dimension: str | None = None) -> str:

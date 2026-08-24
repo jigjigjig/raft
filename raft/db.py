@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS aspects (
   id TEXT PRIMARY KEY,
   question TEXT NOT NULL,
   type TEXT NOT NULL,
+  labels_json TEXT NOT NULL DEFAULT '[]',
   created_from TEXT NOT NULL,
   version INTEGER NOT NULL,
   created_at TEXT NOT NULL
@@ -173,6 +174,8 @@ CREATE TABLE IF NOT EXISTS answers (
   unit TEXT NOT NULL DEFAULT 'count',
   follow_ups_json TEXT NOT NULL DEFAULT '[]',
   standouts_json TEXT NOT NULL DEFAULT '[]',
+  is_overview INTEGER NOT NULL DEFAULT 0,
+  suggestions_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
 
@@ -251,6 +254,11 @@ class Database:
                 "unit": "TEXT NOT NULL DEFAULT 'count'",
                 "follow_ups_json": "TEXT NOT NULL DEFAULT '[]'",
                 "standouts_json": "TEXT NOT NULL DEFAULT '[]'",
+                "is_overview": "INTEGER NOT NULL DEFAULT 0",
+                "suggestions_json": "TEXT NOT NULL DEFAULT '[]'",
+            },
+            "aspects": {
+                "labels_json": "TEXT NOT NULL DEFAULT '[]'",
             },
             "aspect_values": {
                 "score": "REAL",
@@ -323,6 +331,8 @@ class Database:
         row["spec"] = json.loads(row.pop("spec_json", "{}") or "{}")
         row["follow_ups"] = json.loads(row.pop("follow_ups_json", "[]") or "[]")
         row["standouts"] = json.loads(row.pop("standouts_json", "[]") or "[]")
+        row["suggestions"] = json.loads(row.pop("suggestions_json", "[]") or "[]")
+        row["is_overview"] = bool(row.get("is_overview"))
         return row
 
     def record_feature(self, feature: str, status: str, request_id: str | None, notes: str) -> None:

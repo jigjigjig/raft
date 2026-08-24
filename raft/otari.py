@@ -47,6 +47,9 @@ class OtariClient:
         mcp_server_ids: list[str] | None = None,
         guardrail: bool = True,
         repair_schema_once: bool = True,
+        retry_without_parameter: bool = True,
+        drop_parameters: tuple[str, ...] = (),
+        timeout: float | None = None,
     ) -> tuple[CompletionResult, SchemaT | None]:
         role = self.role(role_name)
         if self.settings.raft_otari_mode != "live":
@@ -63,11 +66,13 @@ class OtariClient:
                 + f" for role {role_name}"
             )
         model = (self.settings.raft_llm_model or role.primary) if generic else role.primary
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0,
-        }
+        payload: dict[str, Any] = {"model": model, "messages": messages}
+        if self.settings.raft_llm_max_tokens and "max_tokens" not in drop_parameters:
+            # Reasoning models spend budget thinking before they emit anything;
+            # too small a cap returns an empty answer with finish_reason=length.
+            payload["max_tokens"] = self.settings.raft_llm_max_tokens
+        if self.settings.raft_llm_temperature is not None and "temperature" not in drop_parameters:
+            payload["temperature"] = self.settings.raft_llm_temperature
         if response_schema:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -91,7 +96,7 @@ class OtariClient:
         started = time.perf_counter()
         request_id: str | None = None
         try:
-            async with httpx.AsyncClient(timeout=self.settings.otari_request_timeout_seconds) as client:
+            async with httpx.AsyncClient(timeout=timeout or self.settings.otari_request_timeout_seconds) as client:
                 base_url = (
                     self.settings.raft_llm_base_url or self.settings.otari_generation_base_url
                     if generic
@@ -105,6 +110,48 @@ class OtariClient:
             request_id = response.headers.get("x-request-id")
             if response.status_code >= 400:
                 message = response.text[:2000]
+                # A 400 naming one of our own optional parameters is a model
+                # incompatibility, not a failed request. Drop the parameter and
+                # try once more rather than losing the call.
+                # A deployment with no guardrails service rejects the whole
+                # request. Guardrails are a safety layer over untrusted trace
+                # content, not a precondition for answering a question, so drop
+                # them and say so rather than failing the call.
+                if "guardrail" in message.casefold() and "guardrails" in payload and retry_without_parameter:
+                    self.db.record_feature(
+                        "Guardrails",
+                        "unavailable_on_this_deployment",
+                        request_id,
+                        f"This Otari has no guardrails service; requests are sent unguarded. Exact error: {message[:200]}",
+                    )
+                    payload.pop("guardrails", None)
+                    return await self.complete(
+                        role_name,
+                        messages,
+                        response_schema=response_schema,
+                        tools=tools,
+                        mcp_server_ids=mcp_server_ids,
+                        guardrail=False,
+                        repair_schema_once=repair_schema_once,
+                        retry_without_parameter=False,
+                        drop_parameters=drop_parameters,
+                        timeout=timeout,
+                    )
+                offending = _rejected_parameter(message, payload)
+                if offending and retry_without_parameter:
+                    payload.pop(offending, None)
+                    return await self.complete(
+                        role_name,
+                        messages,
+                        response_schema=response_schema,
+                        tools=tools,
+                        mcp_server_ids=mcp_server_ids,
+                        guardrail=guardrail,
+                        repair_schema_once=repair_schema_once,
+                        retry_without_parameter=False,
+                        drop_parameters=(*drop_parameters, offending),
+                        timeout=timeout,
+                    )
                 raise OtariError(
                     f"Otari returned HTTP {response.status_code}: {message}",
                     status_code=response.status_code,
@@ -124,7 +171,10 @@ class OtariClient:
             request_id = request_id or raw.get("id") or raw.get("request_id")
             choice = raw.get("choices", [{}])[0]
             message = choice.get("message", {})
-            content = message.get("content", "")
+            # Reasoning models return `content: null` alongside a `reasoning`
+            # field until they finish thinking. `.get(k, "")` yields None here,
+            # not "", and stringifying that produced the literal "None".
+            content = message.get("content") or ""
             if isinstance(content, list):
                 content = "".join(
                     item.get("text", "") for item in content if isinstance(item, dict)
@@ -137,6 +187,12 @@ class OtariClient:
                 usage=raw.get("usage") or {},
                 raw=raw,
             )
+            if not result.content.strip() and raw.get("choices", [{}])[0].get("finish_reason") == "length":
+                raise OtariError(
+                    f"{model} used its whole token budget on reasoning and returned no content; "
+                    f"raise RAFT_LLM_MAX_TOKENS (currently {self.settings.raft_llm_max_tokens}).",
+                    request_id=request_id,
+                )
             parsed = None
             if response_schema:
                 try:
@@ -172,6 +228,7 @@ class OtariClient:
                             mcp_server_ids=mcp_server_ids,
                             guardrail=guardrail,
                             repair_schema_once=False,
+                            timeout=timeout,
                         )
                     raise
             self._record_observation(
@@ -313,12 +370,14 @@ class SandboxClient:
             return self.local_reference(rows, code)
         try:
             return await self._hosted_sandbox(rows, api_key, code)
-        except OtariError as error:
+        except (OtariError, httpx.HTTPError, json.JSONDecodeError) as error:
+            # Transport failures are not OtariError, and an uncaught one here
+            # fails the whole run over an aggregation that can just run locally.
             if self.otari:
                 self.otari.db.record_feature(
                     "Code Execution",
                     "live_sandbox_failed_log_pending",
-                    error.request_id,
+                    getattr(error, "request_id", None),
                     f"Direct sandbox aggregation failed and Raft fell back to local execution: {error}",
                 )
             reference = self.local_reference(rows, code)
@@ -473,7 +532,8 @@ async def check_models(settings: Settings, roles: dict[str, ModelRole]) -> dict[
             if api_key not in seen:
                 try:
                     response = await client.get(
-                        f"{base}/api/v1/models", headers={"Authorization": f"Bearer {api_key}"}
+                        f"{base}{settings.management_prefix}/models",
+                        headers={"Authorization": f"Bearer {api_key}"},
                     )
                     if response.status_code >= 400:
                         seen[api_key] = (False, None, f"HTTP {response.status_code}: {response.text[:200]}")
@@ -502,10 +562,102 @@ async def check_models(settings: Settings, roles: dict[str, ModelRole]) -> dict[
                     "available": len(names or ()),
                 }
             )
-    return {"checked": True, "base_url": base, "roles": results}
+    return {
+        "checked": True,
+        "base_url": base,
+        "models_path": f"{base}{settings.management_prefix}/models",
+        "deployment": settings.raft_otari_deployment,
+        "roles": results,
+    }
 
 
 def _model_absent(model: str, names: set[str]) -> bool:
     """Match a configured id against the catalog, ignoring a provider prefix."""
     bare = model.split(":", 1)[-1]
     return not any(candidate == model or candidate.split(":", 1)[-1] == bare for candidate in names)
+
+
+# Parameters Raft sends that a model may refuse. Anything else in a 400 is a
+# real error and must surface.
+_OPTIONAL_PARAMETERS = ("temperature", "response_format", "max_tokens")
+
+
+def _rejected_parameter(message: str, payload: dict[str, Any]) -> str | None:
+    lowered = message.casefold()
+    if not any(word in lowered for word in ("deprecat", "unsupport", "not supported", "unknown", "unrecognized")):
+        return None
+    for name in _OPTIONAL_PARAMETERS:
+        if name in payload and name in lowered:
+            return name
+    return None
+
+
+class OtariEmbeddings:
+    """Vectors from the gateway's own embedding model.
+
+    Standalone Otari mounts `/v1/embeddings`; the hosted platform does not,
+    which is why the local TF-IDF index exists at all. Where this is available
+    it is strictly better for the product's central job: a question phrased
+    "what do customers complain about" has to reach a conversation that says
+    "this is going in circles", and only a real embedding space puts those two
+    near each other.
+    """
+
+    def __init__(self, settings: Settings, api_key: str, model: str = ""):
+        self.settings = settings
+        self.api_key = api_key
+        self.model = model
+        self.dimensions: int | None = None
+
+    @property
+    def name(self) -> str:
+        return f"otari:{self.model or 'default'}"
+
+    def encode(self, texts: list[str], normalize_embeddings: bool = True, batch_size: int | None = None) -> Any:
+        """Synchronous by design: callers are already off the event loop."""
+        import numpy as np
+
+        size = batch_size or self.settings.raft_embedding_batch
+        out: list[list[float]] = []
+        base = self.settings.otari_generation_base_url.rstrip("/")
+        with httpx.Client(timeout=self.settings.otari_request_timeout_seconds) as client:
+            for start in range(0, len(texts), size):
+                chunk = [text or " " for text in texts[start : start + size]]
+                payload: dict[str, Any] = {"input": chunk}
+                if self.model:
+                    payload["model"] = self.model
+                response = client.post(
+                    f"{base}/v1/embeddings",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                )
+                if response.status_code >= 400:
+                    raise OtariError(
+                        f"Embeddings returned HTTP {response.status_code}: {response.text[:300]}",
+                        status_code=response.status_code,
+                        request_id=response.headers.get("x-request-id"),
+                    )
+                body = response.json()
+                rows = sorted(body.get("data", []), key=lambda item: item.get("index", 0))
+                if len(rows) != len(chunk):
+                    raise OtariError(f"Embeddings returned {len(rows)} vectors for {len(chunk)} inputs")
+                out.extend(row["embedding"] for row in rows)
+
+        vectors = np.asarray(out, dtype=np.float32)
+        if vectors.size:
+            self.dimensions = int(vectors.shape[1])
+            if normalize_embeddings:
+                norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+                vectors = vectors / np.clip(norms, 1e-8, None)
+        return vectors
+
+
+def embedding_backend(settings: Settings, roles: dict[str, ModelRole]) -> OtariEmbeddings | None:
+    """The embedding client for this configuration, or None to stay local."""
+    if not settings.uses_otari_embeddings:
+        return None
+    role = roles.get("trace_labeler") or next(iter(roles.values()), None)
+    api_key = (os.getenv(role.api_key_env) if role else None) or settings.raft_llm_api_key
+    if not api_key:
+        return None
+    return OtariEmbeddings(settings, api_key, settings.raft_otari_embedding_model)

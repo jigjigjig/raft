@@ -41,6 +41,7 @@ export const api = {
   explain: (spanId: string) => request<any>(`/api/spans/${spanId}/explain`, { method: "POST", body: "{}" }),
   webSearch: (spanId: string) => request<any>(`/api/spans/${spanId}/web-search`, { method: "POST", body: "{}" }),
   settings: () => request<any>("/api/settings/status"),
+  preflight: () => request<any>("/api/settings/preflight"),
   resetDemo: (traceCount: number, seed: number) =>
     request<any>("/api/settings/reset-demo", {
       method: "POST",

@@ -105,57 +105,58 @@ class Predicate:
     sql: str
     params: tuple[Any, ...]
     label: str
+    id: str = ""
 
 
-def _pred(field_key: str, sql: str, params: tuple[Any, ...], label: str) -> Predicate:
-    return Predicate(field_key, sql, params, label)
+def _pred(field_key: str, sql: str, params: tuple[Any, ...], label: str, id: str = "") -> Predicate:
+    return Predicate(field_key, sql, params, label, id)
 
 
 # Each entry: (regex, predicate factory, consumes -> phrases removed from focus)
 LEXICON: list[tuple[re.Pattern[str], Predicate]] = [
     (re.compile(r"\bgave up\b|\bgive up\b|\bgiving up\b|\bgives up\b|\babandon\w*\b|\bwalked away\b|\bdropped out\b|\bbailed\b"),
-     _pred("user_gave_up", "t.user_gave_up = 1", (), "the user gave up")),
+     _pred("user_gave_up", "t.user_gave_up = 1", (), "the user gave up", id="the_user_gave_up")),
     (re.compile(r"\bfrustrat\w*\b|\bangry\b|\bannoyed\b|\bupset\b|\bmad\b|\birritat\w*\b"),
-     _pred("sentiment_end", "t.sentiment_end IN ('frustrated','angry')", (), "the user ended frustrated or angry")),
+     _pred("sentiment_end", "t.sentiment_end IN ('frustrated','angry')", (), "the user ended frustrated or angry", id="the_user_ended_frustrated_or_angry")),
     (re.compile(r"\bhappy\b|\bsatisfied customers?\b|\bpleased\b|\bthankful\b|\bgrateful\b"),
-     _pred("sentiment_end", "t.sentiment_end = 'positive'", (), "the user ended positively")),
+     _pred("sentiment_end", "t.sentiment_end = 'positive'", (), "the user ended positively", id="the_user_ended_positively")),
     (re.compile(
         r"\bunresolved\b|\bnot resolved\b|\bunsuccessful\b|\bdidn'?t get\b|\bdid not get\b|\bnever got\b|"
         r"\bwithout (?:\w+\s+){0,3}(?:getting|receiving)\b|\bnot satisfied\b|\bunsatisf\w*\b|\bwent unanswered\b|"
         r"\bempty[- ]handed\b|\bno answer\b|\bwithout an answer\b|\bstruggl\w*\b|\bhaving trouble\b|\bpain ?points?\b"),
-     _pred("intent_satisfied", "t.intent_satisfied = 'no'", (), "the user did not get what they wanted")),
+     _pred("intent_satisfied", "t.intent_satisfied = 'no'", (), "the user did not get what they wanted", id="the_user_did_not_get_what_they_wanted")),
     (re.compile(r"\bresolved\b|\bsuccessful\b|\bsucceeded\b|\bworked (?:well|fine)\b|\bwent well\b|\bgot what they wanted\b|\bhappy path\b"),
-     _pred("intent_satisfied", "t.intent_satisfied = 'yes'", (), "the user got what they wanted")),
+     _pred("intent_satisfied", "t.intent_satisfied = 'yes'", (), "the user got what they wanted", id="the_user_got_what_they_wanted")),
     (re.compile(r"\bfail\w*\b|\bbroke\w*\b|\bbreaks?\b|\bwent wrong\b|\bgoes wrong\b|\bproblem\w*\b|\bissues?\b"),
-     _pred("failure_mode", "t.failure_mode != 'none'", (), "something went wrong")),
+     _pred("failure_mode", "t.failure_mode != 'none'", (), "something went wrong", id="something_went_wrong")),
     (re.compile(r"\bloop\w*\b|\bretry\b|\bretries\b|\bretried\b|\brepeat\w* (?:the )?(?:same )?(?:tool|call)\w*\b|\bsame call\b|\bover and over\b|\bin circles\b"),
-     _pred("failure_mode", "t.failure_mode = 'tool_loop'", (), "the agent looped on one tool")),
+     _pred("failure_mode", "t.failure_mode = 'tool_loop'", (), "the agent looped on one tool", id="the_agent_looped_on_one_tool")),
     (re.compile(r"\bhallucinat\w*\b|\bmade up\b|\bmakes up\b|\bmaking up\b|\binvent\w*\b|\bfabricat\w*\b|\bnot true\b|\bwrong information\b"),
-     _pred("failure_mode", "t.failure_mode IN ('wrong_answer','hallucinated_tool') OR t.outcome = 'hallucination'", (), "the agent stated something unverified")),
+     _pred("failure_mode", "t.failure_mode IN ('wrong_answer','hallucinated_tool') OR t.outcome = 'hallucination'", (), "the agent stated something unverified", id="the_agent_stated_something_unverified")),
     (re.compile(r"\bclaimed to\b|\bpretend\w*\b|\bfake success\b|\bsaid it did\b|\bphantom\b|\bhallucinated tool\b"),
-     _pred("failure_mode", "t.failure_mode = 'hallucinated_tool'", (), "the agent claimed an action it never performed")),
+     _pred("failure_mode", "t.failure_mode = 'hallucinated_tool'", (), "the agent claimed an action it never performed", id="the_agent_claimed_an_action_it_never_per")),
     (re.compile(r"\brefus\w*\b|\bdeclin\w*\b|\bwould'?n?'?t help\b|\bwont help\b|\bblocked the user\b"),
-     _pred("failure_mode", "t.failure_mode = 'refusal'", (), "the agent refused")),
+     _pred("failure_mode", "t.failure_mode = 'refusal'", (), "the agent refused", id="the_agent_refused")),
     (re.compile(r"\btime(?:d)? ?out\b|\btimeouts?\b"),
-     _pred("failure_mode", "t.failure_mode = 'timeout'", (), "the request timed out")),
+     _pred("failure_mode", "t.failure_mode = 'timeout'", (), "the request timed out", id="the_request_timed_out")),
     (re.compile(r"\bcontext (?:window|length|overflow)\b|\btoo (?:long|large) (?:for )?context\b|\bran out of context\b"),
-     _pred("failure_mode", "t.failure_mode = 'context_overflow'", (), "the context window was exceeded")),
+     _pred("failure_mode", "t.failure_mode = 'context_overflow'", (), "the context window was exceeded", id="the_context_window_was_exceeded")),
     (re.compile(r"\bprovider error\w*\b|\bupstream error\w*\b|\b5\d\d\b|\bgateway error\b|\boverloaded\b"),
-     _pred("failure_mode", "t.failure_mode = 'provider_error'", (), "an upstream provider error occurred")),
+     _pred("failure_mode", "t.failure_mode = 'provider_error'", (), "an upstream provider error occurred", id="an_upstream_provider_error_occurred")),
     (re.compile(r"\btool error\w*\b|\btool failed\b|\btool failures?\b"),
-     _pred("failure_mode", "t.failure_mode = 'tool_error'", (), "a tool call failed")),
+     _pred("failure_mode", "t.failure_mode = 'tool_error'", (), "a tool call failed", id="a_tool_call_failed")),
     (re.compile(r"\bwrong (?:action|answer|thing)\b|\bmisunderstood\b|\bmisread\b|\banswered the wrong\b"),
-     _pred("failure_mode", "t.failure_mode = 'wrong_answer'", (), "the agent answered the wrong question")),
+     _pred("failure_mode", "t.failure_mode = 'wrong_answer'", (), "the agent answered the wrong question", id="the_agent_answered_the_wrong_question")),
     (re.compile(r"\bcan'?not do\b|\bcan'?t do\b|\bcannot handle\b|\bcan'?t handle\b|\bunable to\b|\bunsupported\b|\bnot supported\b|\bmissing (?:feature|capability|tool)\b|\bunmet\b|\basking for that (?:it|my agent) can'?t\b|\bout of scope\b|\bdoesn'?t support\b"),
-     _pred("outcome", "t.outcome = 'unmet request'", (), "the request was outside the agent's capabilities")),
+     _pred("outcome", "t.outcome = 'unmet request'", (), "the request was outside the agent's capabilities", id="the_request_was_outside_the_agent_s_capa")),
     (re.compile(r"\bcontradict\w*\b|\bcontradiction\b|\bboth (?:said|claimed)\b"),
-     _pred("outcome", "t.outcome = 'contradiction'", (), "the agent contradicted itself")),
+     _pred("outcome", "t.outcome = 'contradiction'", (), "the agent contradicted itself", id="the_agent_contradicted_itself")),
     (re.compile(r"\bincomplete captures?\b|\bpartial captures?\b|\bdisconnect\w*\b"),
-     _pred("capture_completeness", "t.capture_completeness != 'complete'", (), "the capture is incomplete")),
+     _pred("capture_completeness", "t.capture_completeness != 'complete'", (), "the capture is incomplete", id="the_capture_is_incomplete")),
     (re.compile(r"\bguardrail(?:ed| blocked| block)?\b|\bquarantin\w*\b"),
-     _pred("guardrail_status", "t.guardrail_status = 'blocked'", (), "the trace was guardrail-blocked")),
+     _pred("guardrail_status", "t.guardrail_status = 'blocked'", (), "the trace was guardrail-blocked", id="the_trace_was_guardrail_blocked")),
     (re.compile(r"\bmulti[- ]?turn\b|\blong conversations?\b"),
-     _pred("turns", "t.turns >= 4", (), "the conversation ran four or more turns")),
+     _pred("turns", "t.turns >= 4", (), "the conversation ran four or more turns", id="the_conversation_ran_four_or_more_turns")),
 ]
 
 
@@ -215,6 +216,9 @@ class QuerySpec:
     rationale: list[str] = field(default_factory=list)
     matched_phrases: list[str] = field(default_factory=list)
     sort: Literal["value", "key"] = "value"
+    # Set when nothing in the question could be tied to the data, so the answer
+    # is an overview and must not be presented as a precise reply.
+    broad: bool = False
 
     # -- SQL --------------------------------------------------------------
     def where(self) -> tuple[str, list[Any]]:
@@ -438,7 +442,7 @@ class QuestionCompiler:
             cutoff = (now - timedelta(hours=hours)).isoformat()
             phrase = match.group(0).strip()
             return (
-                _pred("started_at", "t.started_at >= ?", (cutoff,), f"it started within {phrase}"),
+                _pred("started_at", "t.started_at >= ?", (cutoff,), f"it started within {phrase}", id="time_window"),
                 phrase,
                 match.span(),
             )
@@ -592,19 +596,19 @@ class DatasetCatalog:
         self._phrases: list[tuple[str, Predicate]] = []
         for app in values.get("app", []):
             for phrase in _name_phrases(app):
-                self._phrases.append((phrase, _pred("app", "t.app = ?", (app,), f"the app is {app}")))
+                self._phrases.append((phrase, _pred("app", "t.app = ?", (app,), f"the app is {app}", id=f"app:{app}")))
         for tool in values.get("tool", []):
             for phrase in _name_phrases(tool):
                 self._phrases.append(
-                    (phrase, _pred("tool", "EXISTS (SELECT 1 FROM trace_tools x WHERE x.trace_id = t.id AND x.tool = ?)", (tool,), f"the {tool} tool was called"))
+                    (phrase, _pred("tool", "EXISTS (SELECT 1 FROM trace_tools x WHERE x.trace_id = t.id AND x.tool = ?)", (tool,), f"the {tool} tool was called", id=f"tool:{tool}"))
                 )
         for model in values.get("model", []):
             short = model.split("/")[-1]
             for phrase in {model.casefold(), short.casefold()}:
-                self._phrases.append((phrase, _pred("model", "t.model = ?", (model,), f"the model is {short}")))
+                self._phrases.append((phrase, _pred("model", "t.model = ?", (model,), f"the model is {short}", id=f"model:{model}")))
         for code in values.get("error_code", []):
             if code:
-                self._phrases.append((code.casefold(), _pred("error_code", "t.error_code = ?", (code,), f"the error code is {code}")))
+                self._phrases.append((code.casefold(), _pred("error_code", "t.error_code = ?", (code,), f"the error code is {code}", id=f"error:{code}")))
         # Longest phrases first so "storefront support" beats "support".
         self._phrases.sort(key=lambda item: len(item[0]), reverse=True)
 
@@ -621,6 +625,10 @@ class DatasetCatalog:
                 "error_code": column("SELECT DISTINCT error_code AS value FROM traces WHERE error_code IS NOT NULL"),
             }
         )
+
+    @property
+    def phrases(self) -> list[tuple[str, Predicate]]:
+        return self._phrases
 
     def match(self, normalized: str) -> list[tuple[str, Predicate, tuple[int, int]]]:
         found: list[tuple[str, Predicate, tuple[int, int]]] = []
@@ -745,3 +753,28 @@ def spec_to_json(spec: QuerySpec) -> str:
         indent=2,
         sort_keys=True,
     )
+
+
+def filter_catalog(catalog: "DatasetCatalog") -> list[dict[str, str]]:
+    """Every filter Raft can apply, as a menu a model can pick from by id.
+
+    The planner never writes SQL. It chooses ids from this list, Raft validates
+    them against its own registry, and the SQL is built here as always - so a
+    model can interpret "what do customers complain about" without being able to
+    reach the database.
+    """
+    menu = [{"id": predicate.id, "label": predicate.label} for _, predicate in LEXICON if predicate.id]
+    for phrase, predicate in catalog.phrases:
+        if predicate.id and not any(item["id"] == predicate.id for item in menu):
+            menu.append({"id": predicate.id, "label": predicate.label})
+    return menu
+
+
+def predicate_by_id(catalog: "DatasetCatalog", identifier: str) -> Predicate | None:
+    for _, predicate in LEXICON:
+        if predicate.id == identifier:
+            return predicate
+    for _, predicate in catalog.phrases:
+        if predicate.id == identifier:
+            return predicate
+    return None

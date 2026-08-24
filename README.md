@@ -19,6 +19,23 @@ Open [http://localhost:8010](http://localhost:8010). No signup, no keys, no
 configuration: the demo workspace generates itself on first boot and Home is
 populated in about a second.
 
+### Upgrading an existing install
+
+```sh
+docker compose up --build
+```
+
+The `raft-data` volume survives rebuilds on purpose, so the demo dataset is not
+regenerated on every restart. When the generator changes, a stored corpus
+version marker no longer matches and the dataset is rebuilt automatically —
+watch for `[raft] demo dataset rebuilt (...)` on startup. To force it, either
+regenerate from Settings or `docker compose down -v`.
+
+This matters because the failure mode is silent: rows built by an older
+generator keep their old text and get schema defaults for any column added
+since, so every content filter matches nothing and every question returns the
+same answer.
+
 For development:
 
 ```sh
@@ -66,9 +83,31 @@ filter is replaced.
 - **Unknown stays unknown.** A base-URL proxy sees LLM latency, not the
   application's own tool duration, so tool timing is shown as unknown rather
   than inferred from message order.
+- **The answer leads with what is disproportionate**, not what is biggest —
+  a group where 17 of 17 conversations fail identically is a finding; the
+  largest group usually just means that app is popular.
 - **Every group says what happened to it** — how many gave up, which failure
   they kept hitting, which app they were in, what they cost — read back from
   the same rows that were counted.
+
+### When Raft cannot pin your question down
+
+A question only narrows the data if its words appear in the conversations.
+Nobody writes "I am complaining" in a support chat — they write *"this is going
+in circles"* — so "what do customers complain about?" matches nothing lexically.
+
+Raft never pretends otherwise. A question it cannot tie to the data returns a
+clearly-labelled **overview** of the whole dataset, plus suggested questions
+built from wording the conversations really contain, each one click away from a
+specific answer. Silently grouping the entire dataset and presenting it as a
+reply is the one thing it will not do — that is how every question ends up
+looking like the same answer.
+
+With a model planner configured, this mostly stops happening: the model
+translates "complain" into recorded filters like *the user ended frustrated*.
+It picks filters by id from a menu Raft supplies and Raft validates every one,
+so the interpretation is the model's and the query stays Raft's — it never
+writes SQL and never returns a number.
 
 ### Why the groups are trustworthy
 
@@ -100,7 +139,12 @@ is producing your answers.
 | Embeddings | corpus-fitted TF-IDF + SVD | same, or `BAAI/bge-small-en-v1.5` with `RAFT_USE_BGE=1` |
 
 Live mode wants Otari (`RAFT_OTARI_MODE=live` plus the role keys in
-`.env.example`). Any OpenAI-compatible Chat Completions endpoint also works via
+`.env.example`). Run `python scripts/otari_setup.py --key <key>` first: it
+discovers which models the key can actually reach, assigns them to roles, and
+makes one real completion and one real embeddings call. Set
+`RAFT_OTARI_DEPLOYMENT=hosted` for `api.otari.ai` (management routes live under
+`/api/v1`) or `standalone` for a self-hosted gateway (`/v1`, and it mounts
+`/v1/embeddings`). Any OpenAI-compatible Chat Completions endpoint also works via
 `RAFT_LLM_PROVIDER=openai_compatible` with `RAFT_LLM_BASE_URL` /
 `RAFT_LLM_API_KEY` / `RAFT_LLM_MODEL`. Otari-only request fields - guardrails,
 `mcp_server_ids`, server-side tools, the sandbox - are simply not sent in that
@@ -150,8 +194,9 @@ python -c "from raft.db import Database; from raft.demo import build_dataset; \
 ## Tests
 
 ```sh
-pytest                     # 86 tests
+pytest                     # 112 tests
 python scripts/eval_judge.py   # measured aspect-judge accuracy
+python scripts/eval_focus.py   # how well a question selects its own subject
 ```
 
 The suite asserts the product claims, not just the plumbing: routing across 16

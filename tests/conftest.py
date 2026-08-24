@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_manager(tmp_path: Path, *, count: int = 220, allowance: float = 0.10) -> AnalysisManager:
+    # Explicit on every field a live .env could otherwise supply.
     settings = Settings(
+        raft_embedding_backend="local",
         raft_otari_mode="mock",
         raft_database_path=tmp_path / "raft.db",
         raft_model_roles_path=ROOT / "model-roles.yaml",
