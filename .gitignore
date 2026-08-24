@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+node_modules/
+web/dist/
+*.tsbuildinfo
+data/*.db
+data/*.db-*
+models/

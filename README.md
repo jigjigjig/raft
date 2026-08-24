@@ -1,0 +1,189 @@
+# Raft
+
+Raft turns a pile of LLM traces into a queryable research dataset. You type a
+question in plain English, Raft decides how to answer it, computes every number
+with code you can read, and links each number back to the conversations it came
+from.
+
+Nothing is precomputed for a fixed list of questions. Type something nobody
+anticipated and it still gets answered.
+
+## Run it
+
+```sh
+cp .env.example .env
+docker compose up --build
+```
+
+Open [http://localhost:8010](http://localhost:8010). No signup, no keys, no
+configuration: the demo workspace generates itself on first boot and Home is
+populated in about a second.
+
+For development:
+
+```sh
+python -m venv .venv && source .venv/bin/activate
+pip install -e '.[dev]'
+uvicorn raft.main:app --reload --port 8010
+
+cd web && npm install && npm run dev
+```
+
+## How a question gets answered
+
+Raft compiles your question into a typed query - a metric, a grouping, a set of
+filters, and whatever meaning is left over - and routes it down one of three
+paths. The Answer page always shows which path it took and why.
+
+| Your question | Path | What actually happens |
+| --- | --- | --- |
+| "Which failure mode costs me the most?" | **Recorded shape** | Filters and grouping become parameterised SQL over recorded columns, then one fixed Python aggregation. |
+| "What do my users struggle with most?" | **Emergent clustering** | Conversations are grouped by mutual nearest neighbours over what each person asked and which tools ran, then each group is named after the request its most typical member actually made. No taxonomy is shipped. |
+| "How many people are getting product suggestions?" | **New aspect** | Raft writes one reusable per-trace question, asks your approval, evaluates it against every eligible conversation, and caches the result. |
+
+The compiler reads more than keywords. `"how much did the billing bot cost me"`
+becomes `sum(cost) where app = billing-bot`. `"which model is slowest"` becomes
+`avg(duration) grouped by model` - average, not total, because ranking by total
+latency just ranks by traffic. `"in the last 7 days"` becomes a bound
+parameter. Words it cannot map survive as the semantic focus and change the
+route rather than being dropped.
+
+Follow-ups inherit scope. Ask "which app do users give up on most", then "now
+only the checkout agent", and the give-up filter carries forward while the app
+filter is replaced.
+
+## What is guaranteed
+
+- **Every number is executed code.** "Show the work" shows the exact SQL with
+  its bound parameters, the exact Python that ran, and its raw stdout. No model
+  ever counts, and no model writes the aggregation.
+- **Every quote is a literal substring** of a stored redacted span, verified in
+  code and dropped if it fails. Never a paraphrase.
+- **Every answer drills down** to exactly the traces that were counted -
+  `len(trace_ids) == count`, asserted in the test suite.
+- **PII never reaches a model or the screen.** Deterministic local redaction
+  runs at ingest; the original is never what gets analysed.
+- **Unknown stays unknown.** A base-URL proxy sees LLM latency, not the
+  application's own tool duration, so tool timing is shown as unknown rather
+  than inferred from message order.
+- **Every group says what happened to it** — how many gave up, which failure
+  they kept hitting, which app they were in, what they cost — read back from
+  the same rows that were counted.
+
+### Why the groups are trustworthy
+
+Grouping is the part that is easiest to fake convincingly, so it is measured.
+The corpus records which intent produced each conversation, which makes cluster
+purity checkable. Flat k-means over these vectors scores ~0.35: it is forced to
+produce k groups from a long tail of distinct requests, so it builds grab-bags
+held together by whichever common word two sentences shared — and then names the
+group after that word ("Puffer vest" for a set of Christmas-return complaints).
+
+Conversations about the same thing are near-duplicates instead, so Raft links
+only *mutual* nearest neighbours above a similarity floor and then merges the
+resulting small, coherent groups by average linkage. That scores ~0.88, and
+`tests/test_analysis.py::test_clusters_are_coherent_not_grab_bags` fails below
+0.6. Group names are real sentences pulled from the group's own traces, which a
+test also enforces — so a label can always be checked by opening the trace.
+
+## Modes
+
+Raft runs fully without any credentials. Settings always states which of these
+is producing your answers.
+
+| | No credentials (default) | Live |
+| --- | --- | --- |
+| Question routing | local compiler | Otari planner over Raft's MCP tools |
+| Aggregation | the same Python, in-process | Otari sandbox session, checked against a local reference |
+| Aspect judgment | `local:semantic-judge-v1` | routed open-weight model |
+| Cluster naming | class-based TF-IDF over member wording | routed model |
+| Embeddings | corpus-fitted TF-IDF + SVD | same, or `BAAI/bge-small-en-v1.5` with `RAFT_USE_BGE=1` |
+
+Live mode wants Otari (`RAFT_OTARI_MODE=live` plus the role keys in
+`.env.example`). Any OpenAI-compatible Chat Completions endpoint also works via
+`RAFT_LLM_PROVIDER=openai_compatible` with `RAFT_LLM_BASE_URL` /
+`RAFT_LLM_API_KEY` / `RAFT_LLM_MODEL`. Otari-only request fields - guardrails,
+`mcp_server_ids`, server-side tools, the sandbox - are simply not sent in that
+mode, and Settings says so rather than claiming the feature.
+
+### How good is the local aspect judge?
+
+It is a classifier, not a language model, and the product says so wherever its
+output appears. `python scripts/eval_judge.py` measures it against the corpus's
+own ground truth:
+
+```
+mean F1 0.59 over 10 labelled aspect questions
+```
+
+It is strong when a conversation states the thing in its own words (visa
+questions F1 1.00, cancellations 0.85, deploy requests 0.81) and weak where the
+question and the conversation use different words for the same idea, or where
+the difference is negation — "Did the user ask for a refund?" scores 0.14,
+partly because "I did not ask for a refund" contains the word too.
+
+That is why every aspect answer ships with a
+verification sample of five yes and five no, a plain warning that no model was
+involved, and an editable question - a changed question creates a new aspect
+version rather than overwriting the old evidence. With a model configured, that
+step is a model call instead.
+
+## The demo dataset
+
+Generated by `raft/corpus.py`: eight apps, roughly fifty user intents, and a
+compositional template system producing hundreds of distinct openings. Each
+conversation is built first - an app with a bounded tool surface, a user asking
+for something inside or outside it - and every label is then derived from the
+spans that were generated. `turns`, `tool_calls`, `distinct_tools`,
+`cost_usd` and the rest are checked against the stored spans in
+`tests/test_corpus.py`, so a shape column can never disagree with the trace
+beside it.
+
+Regenerate at any size or seed from Settings, or:
+
+```sh
+python -c "from raft.db import Database; from raft.demo import build_dataset; \
+  from pathlib import Path; db=Database(Path('data/raft.db')); db.initialize(); \
+  print(build_dataset(db, count=2000, seed=1))"
+```
+
+## Tests
+
+```sh
+pytest                     # 86 tests
+python scripts/eval_judge.py   # measured aspect-judge accuracy
+```
+
+The suite asserts the product claims, not just the plumbing: routing across 16
+phrasings, groups summing to the denominator, quotes being literal substrings,
+drill-down exactness, budget pause and resume, aspect versioning, and the PRD's
+requirement that the five example questions span all three paths.
+
+## Live Otari gate
+
+1. Configure every role key from `.env.example` and set `RAFT_OTARI_MODE=live`.
+2. Provision the workspace-level Routing policies, Guardrails, budgets, MCP
+   registration, sandbox, and web search.
+3. Run `python scripts/live_smoke.py single-label` before using any downstream
+   feature.
+4. Run the 40/20 manual gate in `manual-label-review.md`.
+5. Run `all-models`, `fallback-drill`, `budget-probe`, `code-execution`,
+   `guardrails`, and `web-search` through `scripts/live_smoke.py`.
+6. Replace `pending` evidence in `otari-log.md` immediately after each live
+   attempt, using only observed request IDs, errors, costs, latency and
+   friction.
+
+## Public demo
+
+Configure a named Cloudflare Tunnel with two hostnames - the application
+hostname proxying to `http://raft:8000`, and an MCP hostname also proxying
+there, which Raft then restricts to `/mcp` and `/api/health`. Then run
+`docker compose --profile tunnel up --build`. Full handoff in `DEPLOYMENT.md`
+and `tester-script.md`.
+
+## What is deliberately absent
+
+SQLite rather than PostgreSQL/pgvector, NumPy over the vectors rather than a
+vector database, in-process background tasks rather than Redis/Dramatiq, one
+desktop size, one dark theme. No Alembic, virtualization, mobile breakpoints,
+light theme, Playwright suite, or axe suite.
