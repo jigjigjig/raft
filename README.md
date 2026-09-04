@@ -8,6 +8,12 @@ from.
 Nothing is precomputed for a fixed list of questions. Type something nobody
 anticipated and it still gets answered.
 
+**Try it:** https://raft-production.up.railway.app — no signup; the demo
+workspace of 847 redacted conversations is already there. Start with one of the
+example questions on the Home page, then type your own. The Otari integration
+log with every observed request, error and measurement is in
+[`otari-log.md`](otari-log.md).
+
 ## Run it
 
 ```sh
@@ -46,6 +52,20 @@ uvicorn raft.main:app --reload --port 8010
 cd web && npm install && npm run dev
 ```
 
+## What it looks like
+
+![Home: ask your traces anything](docs/screenshots/01-home.jpg)
+
+![Emergent clustering: named groups, and the ones that behave unlike the rest](docs/screenshots/02-clustering-answer.jpg)
+
+![Show the work: the SQL, the Python, and the stdout behind one number](docs/screenshots/03-show-the-work.jpg)
+
+![A new per-trace aspect asks for approval before spending](docs/screenshots/04-confirmation.jpg)
+
+![Trace detail: redacted spans and the quote a number linked to](docs/screenshots/05-trace-detail.jpg)
+
+![Question to answer to trace, in one pass](docs/screenshots/raft-flow.gif)
+
 ## How a question gets answered
 
 Raft compiles your question into a typed query - a metric, a grouping, a set of
@@ -55,7 +75,7 @@ paths. The Answer page always shows which path it took and why.
 | Your question | Path | What actually happens |
 | --- | --- | --- |
 | "Which failure mode costs me the most?" | **Recorded shape** | Filters and grouping become parameterised SQL over recorded columns, then one fixed Python aggregation. |
-| "What do my users struggle with most?" | **Emergent clustering** | Conversations are grouped by mutual nearest neighbours over what each person asked and which tools ran, then each group is named after the request its most typical member actually made. No taxonomy is shipped. |
+| "What do my users struggle with most?" | **Emergent clustering** | Conversations are grouped by mutual nearest neighbours over what each person asked and which tools ran, then each group is named — by the routed cluster-namer model in live mode, or after the request its most typical member actually made when no model is configured. No taxonomy is shipped, and the names never change the counts. |
 | "How many people are getting product suggestions?" | **New aspect** | Raft writes one reusable per-trace question, asks your approval, evaluates it against every eligible conversation, and caches the result. |
 
 The compiler reads more than keywords. `"how much did the billing bot cost me"`
@@ -132,16 +152,19 @@ is producing your answers.
 
 | | No credentials (default) | Live |
 | --- | --- | --- |
-| Question routing | local compiler | Otari planner over Raft's MCP tools |
-| Aggregation | the same Python, in-process | Otari sandbox session, checked against a local reference |
+| Question routing | local compiler | Otari planner; it gains Raft's MCP tools once the server is registered with Otari, which needs the public URL |
+| Aggregation | the same Python, in-process | Otari sandbox session when the deployment has one; hosted `api.otari.ai` currently returns 503, so the same Python runs in-process and "Show the work" names which |
 | Aspect judgment | `local:semantic-judge-v1` | routed open-weight model |
 | Cluster naming | class-based TF-IDF over member wording | routed model |
 | Embeddings | corpus-fitted TF-IDF + SVD | same, or `BAAI/bge-small-en-v1.5` with `RAFT_USE_BGE=1` |
 
 Live mode wants Otari (`RAFT_OTARI_MODE=live` plus the role keys in
-`.env.example`). Run `python scripts/otari_setup.py --key <key>` first: it
-discovers which models the key can actually reach, assigns them to roles, and
-makes one real completion and one real embeddings call. Set
+`.env.example`). Run `python scripts/otari_setup.py --key <key> --base
+https://api.otari.ai --deployment hosted` first: it discovers which models the
+key can actually reach, and makes one real completion and one real embeddings
+call. Do not pass `--write` against hosted Otari: its model-preference list
+matches `bedrock:` catalog entries before `mzai:` ones and would replace the
+open-weights roles in `model-roles.yaml` with models the key cannot use. Set
 `RAFT_OTARI_DEPLOYMENT=hosted` for `api.otari.ai` (management routes live under
 `/api/v1`) or `standalone` for a self-hosted gateway (`/v1`, and it mounts
 `/v1/embeddings`). Any OpenAI-compatible Chat Completions endpoint also works via
@@ -220,11 +243,37 @@ requirement that the five example questions span all three paths.
 
 ## Public demo
 
-Configure a named Cloudflare Tunnel with two hostnames - the application
-hostname proxying to `http://raft:8000`, and an MCP hostname also proxying
-there, which Raft then restricts to `/mcp` and `/api/health`. Then run
-`docker compose --profile tunnel up --build`. Full handoff in `DEPLOYMENT.md`
-and `tester-script.md`.
+The public instance runs on Railway from this repository's `Dockerfile`: one
+service, a persistent volume mounted at `/data` for the SQLite database, the
+role keys as service variables, and `PORT=8000`. The demo corpus generates
+itself on the first boot of an empty volume. To reproduce: `railway init`,
+`railway volume add -m /data`, set the variables from `.env.example`,
+`railway domain --port 8000`, `railway up`.
+
+A self-hosted alternative with a named Cloudflare Tunnel is documented in
+`DEPLOYMENT.md`. `tester-script.md` is the five-minute walk-through an outside
+tester follows.
+
+## Known limitations, 4 September 2026
+
+- One desktop size: the layout has a 1180px minimum width and no breakpoints, so a
+  narrow laptop window scrolls horizontally on the Traces page.
+- A new per-trace aspect over 847 conversations takes minutes, not seconds, at
+  the 3-in-flight concurrency the hosted gateway tolerates tonight (see
+  `otari-log.md`); asking a cached question is instant.
+- If the gateway stops answering mid-run, the run pauses with its judged rows
+  saved and a Resume button rather than finishing on a different judge. That is
+  deliberate; it means a live demo can end on a pause card.
+- The demo corpus is generated, and a few generated request sentences have
+  grammar slips ("Is the running shoes true to size?") that show when they are
+  used as group names.
+- An answer does not yet say on its own card whether the Otari planner or the
+  local compiler chose its path; Settings records planner calls, but per-answer
+  attribution needs a persisted field and is the next change planned.
+- Raft's MCP server serves five read-only tools at `/mcp`, but it is not yet
+  registered with Otari, so no planner request has carried `mcp_server_ids`.
+- No outside tester has walked `tester-script.md` yet; that is scheduled for
+  5 September and will be recorded in `otari-log.md`.
 
 ## What is deliberately absent
 

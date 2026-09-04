@@ -23,7 +23,7 @@ Then start both services:
 docker compose --profile tunnel up -d --build
 ```
 
-When `RAFT_PUBLIC_MCP_URL` is configured, the FastAPI middleware rejects every path except `/mcp` and `/api/health` on that hostname. The MCP tools themselves expose only redacted, read-only SQL projections.
+`RAFT_PUBLIC_MCP_URL` designates a *second, MCP-only* hostname. When it is set, the FastAPI middleware rejects every path except `/mcp` and `/api/health` for requests whose `Host` header matches it — so it must never be the application's own hostname. On a single-hostname deployment (the public Railway instance, for example) leave it blank: `/mcp` is served on the application origin regardless, and the middleware is inert. The MCP tools themselves expose only redacted, read-only SQL projections.
 
 Verify from a device outside the author's network:
 

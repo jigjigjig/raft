@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -322,7 +323,7 @@ async def run_events(request: Request, run_id: str) -> StreamingResponse:
 
     async def stream() -> AsyncIterator[str]:
         last_payload = ""
-        terminal = {"complete", "paused_budget", "guardrail_blocked", "failed"}
+        terminal = {"complete", "paused_budget", "paused_provider", "guardrail_blocked", "failed"}
         while not await request.is_disconnected():
             row = db.get_run(run_id)
             if not row:
@@ -366,7 +367,13 @@ def list_aspects():
                COUNT(av.trace_id) AS evaluated,
                SUM(CASE WHEN av.value_json='true' THEN 1 ELSE 0 END) AS yes_count
         FROM aspects a LEFT JOIN aspect_values av ON av.aspect_id = a.id AND av.status='complete'
-        GROUP BY a.id ORDER BY a.created_at DESC
+        GROUP BY a.id
+        -- An aspect nobody confirmed has no rows and no answer: it is a draft a
+        -- visitor abandoned at the estimate, not a saved aspect. Listing it puts
+        -- near-identical 0-evaluated rows beside the real one, which reads as a
+        -- bug. HAVING, not WHERE: `evaluated` is an aggregate.
+        HAVING COUNT(av.trace_id) > 0
+        ORDER BY a.created_at DESC
         """
     )
 
@@ -419,7 +426,18 @@ def settings_status() -> dict:
     }
     labelled = db.fetch_one("SELECT COUNT(*) AS count FROM trace_label_provenance")
     cluster_run = db.fetch_one("SELECT * FROM cluster_runs ORDER BY created_at DESC LIMIT 1")
-    aspects = db.fetch_one("SELECT COUNT(*) AS count FROM aspects")
+    # The same predicate the Saved aspects list uses, as a subquery rather than a
+    # restatement: a counter that says 2 above a list of 1 is worse than no counter.
+    aspects = db.fetch_one(
+        """
+        SELECT COUNT(*) AS count FROM (
+          SELECT a.id
+          FROM aspects a LEFT JOIN aspect_values av ON av.aspect_id = a.id AND av.status='complete'
+          GROUP BY a.id
+          HAVING COUNT(av.trace_id) > 0
+        )
+        """
+    )
     return {
         "mode": settings.raft_otari_mode,
         "roles": role_rows,
@@ -453,16 +471,80 @@ def settings_status() -> dict:
     }
 
 
+def _role_was_called(role: str) -> bool:
+    return bool(db.fetch_one("SELECT 1 AS ok FROM model_observations WHERE role=? LIMIT 1", (role,)))
+
+
+def _observed_planner() -> str:
+    """What the planner actually did, not what live mode intends it to do."""
+    if not _role_was_called("planner"):
+        return "not yet observed"
+    # mcp_server_ids is only ever sent when the server id is configured, so a
+    # planner call plus a configured id is the only combination that proves the
+    # tools were offered. A request id alone proves nothing about MCP.
+    if settings.otari_planner_mcp_server_id:
+        return "Otari planner + Raft MCP tools"
+    return "Otari planner (no MCP server registered)"
+
+
+def _observed_aggregation() -> str:
+    row = db.fetch_one("SELECT status, notes FROM feature_evidence WHERE feature='Code Execution'")
+    if not row:
+        return "not yet observed"
+    if "failed" in str(row["status"]):
+        # The exact body belongs in the feature-evidence row and the log, not in a
+        # settings cell: a raw JSON payload here reads as a crash rather than as a
+        # degradation Raft handled on purpose.
+        code = re.search(r"HTTP (\d{3})", str(row["notes"]))
+        return (
+            "the same Python, executed in this process (the Otari sandbox was tried and "
+            + (f"returned HTTP {code.group(1)})" if code else "failed)")
+        )
+    if "observed" in str(row["status"]):
+        return "Otari sandbox session"
+    return "not yet observed"
+
+
+def _observed_aspect_judge() -> str:
+    run = db.fetch_one(
+        "SELECT id, status, completed, total, aspect_id FROM runs "
+        "WHERE aspect_id IS NOT NULL AND aspect_id != '' ORDER BY rowid DESC LIMIT 1"
+    )
+    if not run:
+        return "not yet observed"
+    judges = [
+        str(row["model_id"])
+        for row in db.fetch_all(
+            "SELECT DISTINCT model_id FROM aspect_values WHERE aspect_id=? ORDER BY model_id",
+            (run["aspect_id"],),
+        )
+    ]
+    if not judges:
+        return "not yet observed"
+    label = ", ".join(judges)
+    if str(run["status"]).startswith("paused"):
+        # Judged rows are judged rows, but the reader should know the run is
+        # not finished before they read the model name as the whole story.
+        return f"{label} (most recent run paused at {int(run['completed']):,} of {int(run['total']):,})"
+    return label
+
+
+def _observed_cluster_naming() -> str:
+    if _role_was_called("cluster_namer"):
+        return "routed model"
+    return "named from member wording (no live cluster-naming call recorded)"
+
+
 def _analysis_status(aspects_defined: int) -> dict:
     live = settings.raft_otari_mode == "live"
     otari = live and settings.raft_llm_provider == "otari"
     return {
         "mode": settings.raft_otari_mode,
         "provider": settings.raft_llm_provider if live else "none",
-        "planner": "Otari planner + Raft MCP tools" if otari else ("model planner" if live else "local question compiler"),
-        "aggregation": "Otari sandbox session" if otari else "local execution of the same Python source",
-        "aspect_judge": "routed model" if live else "local:semantic-judge-v1",
-        "cluster_naming": "routed model" if live else "class-based TF-IDF over member wording",
+        "planner": _observed_planner() if otari else ("model planner" if live else "local question compiler"),
+        "aggregation": _observed_aggregation() if otari else "local execution of the same Python source",
+        "aspect_judge": _observed_aspect_judge() if live else "local:semantic-judge-v1",
+        "cluster_naming": _observed_cluster_naming() if live else "class-based TF-IDF over member wording",
         "embeddings": manager.index.backend,
         "aspects_defined": aspects_defined,
         "otari_features_available": otari,

@@ -18,6 +18,21 @@ from raft.schemas import CompletionResult
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
+def route_key(model: str | None) -> str:
+    """A model id without the gateway prefix it echoes back stripped.
+
+    Raft asks for `mzai:Qwen/Qwen3-30B-A3B-Instruct-2507`; the gateway answers
+    `Qwen/Qwen3-30B-A3B-Instruct-2507`. Comparing those raw made every single
+    call look like a reroute, and recorded a Routing fallback that never
+    happened.
+    """
+    return (model or "").split(":", 1)[-1].strip().casefold()
+
+
+def same_model(left: str | None, right: str | None) -> bool:
+    return route_key(left) == route_key(right)
+
+
 class OtariError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None, request_id: str | None = None):
         super().__init__(message)
@@ -50,6 +65,8 @@ class OtariClient:
         retry_without_parameter: bool = True,
         drop_parameters: tuple[str, ...] = (),
         timeout: float | None = None,
+        model_override: str = "",
+        models_tried: tuple[str, ...] = (),
     ) -> tuple[CompletionResult, SchemaT | None]:
         role = self.role(role_name)
         if self.settings.raft_otari_mode != "live":
@@ -65,7 +82,9 @@ class OtariClient:
                 + (" or RAFT_LLM_API_KEY" if generic else "")
                 + f" for role {role_name}"
             )
-        model = (self.settings.raft_llm_model or role.primary) if generic else role.primary
+        model = model_override or (
+            (self.settings.raft_llm_model or role.primary) if generic else role.primary
+        )
         payload: dict[str, Any] = {"model": model, "messages": messages}
         if self.settings.raft_llm_max_tokens and "max_tokens" not in drop_parameters:
             # Reasoning models spend budget thinking before they emit anything;
@@ -136,6 +155,8 @@ class OtariClient:
                         retry_without_parameter=False,
                         drop_parameters=drop_parameters,
                         timeout=timeout,
+                        model_override=model_override,
+                        models_tried=models_tried,
                     )
                 offending = _rejected_parameter(message, payload)
                 if offending and retry_without_parameter:
@@ -151,7 +172,45 @@ class OtariClient:
                         retry_without_parameter=False,
                         drop_parameters=(*drop_parameters, offending),
                         timeout=timeout,
+                        model_override=model_override,
+                        models_tried=models_tried,
                     )
+                # A model that the deployment does not have is not a failed
+                # request, it is the wrong candidate. Walk the role's declared
+                # fallbacks rather than losing the call: a 70B disappearing from
+                # the catalog killed two roles outright for a whole evening.
+                if (
+                    response.status_code == 404
+                    and "does not exist" in message.casefold()
+                    and not generic
+                ):
+                    attempted = (*models_tried, model)
+                    remaining = [
+                        candidate
+                        for candidate in (role.primary, *role.fallbacks)
+                        if not any(same_model(candidate, seen) for seen in attempted)
+                    ]
+                    if remaining:
+                        self.db.record_feature(
+                            "Routing",
+                            "raft_side_fallback_log_pending",
+                            request_id,
+                            f"{model} does not exist on this deployment; Raft advanced to {remaining[0]}.",
+                        )
+                        return await self.complete(
+                            role_name,
+                            messages,
+                            response_schema=response_schema,
+                            tools=tools,
+                            mcp_server_ids=mcp_server_ids,
+                            guardrail=guardrail,
+                            repair_schema_once=repair_schema_once,
+                            retry_without_parameter=retry_without_parameter,
+                            drop_parameters=drop_parameters,
+                            timeout=timeout,
+                            model_override=remaining[0],
+                            models_tried=attempted,
+                        )
                 raise OtariError(
                     f"Otari returned HTTP {response.status_code}: {message}",
                     status_code=response.status_code,
@@ -229,6 +288,8 @@ class OtariClient:
                             guardrail=guardrail,
                             repair_schema_once=False,
                             timeout=timeout,
+                            model_override=model_override,
+                            models_tried=models_tried,
                         )
                     raise
             self._record_observation(
@@ -256,7 +317,7 @@ class OtariClient:
                     request_id,
                     f"A guarded request completed; response verdict header={verdict!r}.",
                 )
-            if result.model and result.model != model:
+            if result.model and not same_model(result.model, model):
                 self.db.record_feature(
                     "Routing",
                     "fallback_observed_log_pending",

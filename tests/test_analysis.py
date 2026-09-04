@@ -7,13 +7,30 @@ traces that were counted, and different questions produce different answers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
+from raft.analysis import AspectJudgment
+from raft.judge import JUDGE_ID
+from raft.otari import OtariError
+from raft.schemas import CompletionResult
 from tests.conftest import answer_for, make_manager
+
+
+_real_sleep = asyncio.sleep
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """Retry backoff is behaviour to assert, not seconds to spend in a test.
+
+    It still yields: the progress reporter awaits this same patched sleep in a
+    loop, and a coroutine that never suspends starves the event loop.
+    """
+    await _real_sleep(0)
 
 
 @pytest.mark.asyncio
@@ -278,3 +295,132 @@ async def test_a_question_that_does_name_a_subject_is_not_flagged(manager) -> No
     answer = await answer_for(manager, "what do people ask the storefront support about")
     assert answer["is_overview"] is False
     assert answer["denominator"] < manager.db.trace_count()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_5xx_is_retried_rather_than_abandoned(tmp_path: Path, monkeypatch) -> None:
+    """The hosted gateway 502s under burst. A retried row is still an Otari row."""
+    flaky = make_manager(tmp_path, count=40)
+    flaky.settings.raft_otari_mode = "live"
+    monkeypatch.setattr("raft.analysis.asyncio.sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def complete(role, messages, **kwargs):
+        if role != "aspect_evaluator":
+            raise OtariError("Missing key for role in this test")
+        calls["n"] += 1
+        if calls["n"] <= 2:  # the first row 502s twice, then the gateway recovers
+            raise OtariError("Otari returned HTTP 502: auth service unavailable", status_code=502)
+        return (
+            CompletionResult(content="{}", request_id=f"req_{calls['n']}", model="Qwen/Qwen3-30B-A3B-Instruct-2507"),
+            AspectJudgment(value=True, confidence=0.9, evidence_quote=""),
+        )
+
+    monkeypatch.setattr(flaky.otari, "complete", complete)
+    answer = await answer_for(flaky, "How many conversations mention a refund?")
+
+    row = flaky.db.get_run(answer["run_id"])
+    assert row["status"] == "complete"
+    # Two calls were burnt on retries, so there are more calls than traces.
+    assert calls["n"] == flaky.db.trace_count() + 2
+    judges = {
+        judge["model_id"]
+        for judge in flaky.db.fetch_all(
+            "SELECT DISTINCT model_id FROM aspect_values WHERE aspect_id=?", (row["aspect_id"],)
+        )
+    }
+    assert judges == {"Qwen/Qwen3-30B-A3B-Instruct-2507"}
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_5xx_pauses_instead_of_switching_judges(tmp_path: Path, monkeypatch) -> None:
+    """Two judges in one total is two scales in one number. Pause instead."""
+    down = make_manager(tmp_path, count=40)
+    down.settings.raft_otari_mode = "live"
+    monkeypatch.setattr("raft.analysis.asyncio.sleep", _no_sleep)
+
+    async def always_502(role, messages, **kwargs):
+        if role != "aspect_evaluator":
+            raise OtariError("Missing key for role in this test")
+        raise OtariError("Otari returned HTTP 502: auth service unavailable", status_code=502)
+
+    monkeypatch.setattr(down.otari, "complete", always_502)
+    plan = await down.plan_question("How many conversations mention a refund?")
+    run = down.create_run(plan)
+    down.confirm_run(run.id, plan.aspect.question if plan.aspect else None)
+    await down.tasks[run.id]
+
+    paused = down.db.get_run(run.id)
+    assert paused["status"] == "paused_provider"
+    assert "Otari stopped answering" in paused["message"]
+    # Nothing was judged, and above all nothing was judged by the local judge.
+    judged = down.db.fetch_all(
+        "SELECT model_id FROM aspect_values WHERE aspect_id=?", (paused["aspect_id"],)
+    )
+    assert JUDGE_ID not in {judge["model_id"] for judge in judged}
+    assert down.db.get_answer_for_run(run.id) is None
+
+    # And it resumes through the same door a budget pause uses.
+    down.settings.raft_otari_mode = "mock"
+    down.resume_run(run.id)
+    await down.tasks[run.id]
+    assert down.db.get_run(run.id)["status"] == "complete"
+
+
+def test_a_slower_concurrency_is_estimated_as_slower(tmp_path: Path) -> None:
+    """The floor in the estimate used to clamp every low concurrency together.
+
+    `eligible / max(per_second, 1.0)` meant 1, 2 and 3 calls in flight all
+    promised the same time, so a one-at-a-time run advertised the speed of a
+    parallel one.
+    """
+    manager = make_manager(tmp_path, count=40)
+    manager.settings.raft_otari_mode = "live"
+
+    manager.settings.raft_aspect_concurrency = 1
+    slow_min, slow_max = manager._estimate_seconds(847)
+    manager.settings.raft_aspect_concurrency = 3
+    fast_min, fast_max = manager._estimate_seconds(847)
+
+    assert slow_min > fast_min
+    assert slow_max > fast_max
+    # And roughly in proportion: three times the calls in flight, about a third
+    # of the wall clock.
+    assert 2.5 < slow_max / fast_max < 3.5
+
+
+def test_an_exact_tie_is_not_described_as_close_behind(tmp_path: Path) -> None:
+    """Prose about numbers has to survive being checked against them.
+
+    Observed live: two groups of 23 rendered as "Dry Cleaning Questions is close
+    behind at 23." directly under a list showing both at 23. A tie is a tie, and
+    the count needs its unit.
+    """
+    from raft.query import QuerySpec
+    from raft.schemas import AnswerGroup
+
+    manager = make_manager(tmp_path, count=40)
+    spec = QuerySpec(question="what do my users struggle with most?")
+    spec.path = "layer2_cluster"
+
+    def group(key: str, label: str, count: int) -> AnswerGroup:
+        return AnswerGroup(key=key, label=label, count=count, share=count / 50, trace_ids=[], value=count)
+
+    result = {"unit": "count"}
+    tied = manager._interpretation(spec, result, [group("0", "Missing Items", 23), group("1", "Dry Cleaning Questions", 23)], 50)
+    assert "Dry Cleaning Questions is tied with Missing Items at 23 conversations." in tied
+    assert "close behind" not in tied
+
+    # Genuinely behind, but not by enough for the multiple: unit still carried.
+    behind = manager._interpretation(spec, result, [group("0", "Missing Items", 25), group("1", "Dry Cleaning Questions", 23)], 50)
+    assert "Dry Cleaning Questions is close behind at 23 conversations." in behind
+
+    # A clear leader still gets the multiple rather than either sentence.
+    ahead = manager._interpretation(spec, result, [group("0", "Missing Items", 40), group("1", "Dry Cleaning Questions", 8)], 50)
+    assert "× the next group, Dry Cleaning Questions." in ahead
+    assert "close behind" not in ahead and "tied with" not in ahead
+
+    # And the singular is not "1 conversations".
+    one = manager._interpretation(spec, result, [group("0", "Missing Items", 1), group("1", "Dry Cleaning Questions", 1)], 50)
+    assert "at 1 conversation." in one

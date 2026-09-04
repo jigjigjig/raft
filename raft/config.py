@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     raft_otari_deployment: Literal["standalone", "hosted"] = "standalone"
     # One model call per conversation is unusable in series over hundreds of
     # traces; this is how many run at once.
-    raft_aspect_concurrency: int = 24
+    raft_aspect_concurrency: int = 3
     raft_embedding_batch: int = 64
     raft_llm_base_url: str = ""
     raft_llm_api_key: str = ""

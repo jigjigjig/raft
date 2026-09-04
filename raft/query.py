@@ -518,11 +518,10 @@ class QuestionCompiler:
                 spec.rationale.append(
                     "Clustering is focused on: " + ", ".join(spec.focus_terms[:8]) + "."
                 )
-        else:
-            spec.rationale.append(
-                "No saved field answers this, so Raft will define a reusable per-trace aspect and evaluate it "
-                "once over every eligible conversation."
-            )
+        # The layer3 bullet is written by AnalysisManager after planning, not
+        # here: the planner can still replace `aspect_question`, and a bullet
+        # built from the compiler's wording quoted a question that was never
+        # the one evaluated.
 
 
 _FILLER = frozenset(

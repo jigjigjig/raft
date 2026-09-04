@@ -27,6 +27,7 @@ RunStatus = Literal[
     "synthesizing",
     "complete",
     "paused_budget",
+    "paused_provider",
     "guardrail_blocked",
     "failed",
 ]

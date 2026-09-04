@@ -24,18 +24,28 @@ export function HomePage() {
   };
 
   const data = home.data;
-  const traceCount = data?.trace_count ?? 0;
-  const window = data?.window;
+  // `window` shadowed the global here. The count and the date range are only
+  // rendered once the payload exists: defaulting to 0 printed "0 captured
+  // conversations" on every cold load, which is a wrong number, not a blank one.
+  const captureWindow = data?.window;
+  const captureRange =
+    captureWindow?.first && captureWindow?.last
+      ? ` (${new Date(captureWindow.first).toLocaleDateString()} – ${new Date(captureWindow.last).toLocaleDateString()})`
+      : "";
 
   return (
     <div className="home-page page-enter">
       <section className="home-hero">
         <div className="eyebrow"><ShieldCheck size={14} /> Redacted, traceable evidence</div>
-        <h1>What do you want to know<br />about your agents?</h1>
+        <h1>Ask your traces anything.</h1>
         <p>
-          Ask anything about {traceCount.toLocaleString()} captured conversations
-          {window?.first ? ` from ${new Date(window.first).toLocaleDateString()} to ${new Date(window.last).toLocaleDateString()}` : ""}.
-          Raft reads the question, decides how to answer it, executes every number, and links each one back to real traces.
+          {/* The paragraph always renders. Only the count and the range wait for
+              the payload: gating the whole sentence jumped the page three lines
+              on every cold load, and defaulting the count to 0 printed a wrong
+              number. This costs at most one line of shift and never lies. */}
+          Raft turns {data ? `${data.trace_count.toLocaleString()} ` : ""}captured LLM conversations{captureRange} into
+          a dataset you can question in plain English. Type anything — Raft decides how to answer, computes
+          every number with code you can read, and links each one back to the conversations it came from.
         </p>
         <PromptInput value={question} onChange={setQuestion} onSubmit={() => submit()} pending={ask.isPending} />
         {ask.error && <div className="inline-error" role="alert">{(ask.error as Error).message}</div>}

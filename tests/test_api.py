@@ -288,3 +288,43 @@ def test_a_broad_question_is_labelled_and_offers_a_way_forward(client: TestClien
 def test_a_specific_question_is_not_flagged_as_an_overview(client: TestClient) -> None:
     answer = ask(client, "Which app do users give up on most?")
     assert answer["is_overview"] is False
+
+
+def test_settings_lists_only_aspects_that_were_actually_evaluated(client) -> None:
+    """A never-evaluated aspect is an abandoned draft, not a saved aspect.
+
+    `_aspect_for` reuses on an exact question string, so every planner rewording
+    of the same question mints another row. Without this, Settings shows the one
+    real result beside two or three near-identical 0-evaluated drafts.
+    """
+    from raft.db import utc_now
+    import raft.main as main
+
+    for aspect_id, question in (
+        ("asp_never_run_v1", "A question nobody confirmed?"),
+        ("asp_did_run_v1", "A question somebody did confirm?"),
+    ):
+        main.db.execute(
+            "INSERT INTO aspects(id,question,type,created_from,version,created_at) VALUES(?,?,?,?,?,?)",
+            (aspect_id, question, "boolean", "test", 1, utc_now()),
+        )
+    trace_id = main.db.fetch_one("SELECT id FROM traces LIMIT 1")["id"]
+    main.db.execute(
+        """
+        INSERT INTO aspect_values(trace_id,aspect_id,value_json,confidence,model_id,prompt_version,
+                                  status,cost_usd,request_id,score,evidence_quote)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (trace_id, "asp_did_run_v1", "true", 0.9, "test", "v1", "complete", 0.0, None, None, ""),
+    )
+
+    listed = {row["id"]: row for row in client.get("/api/aspects").json()}
+    # Both halves matter: without the first the test is vacuous on an empty list.
+    assert "asp_did_run_v1" in listed and int(listed["asp_did_run_v1"]["evaluated"]) == 1
+    assert "asp_never_run_v1" not in listed
+    assert all(int(row["evaluated"]) > 0 for row in listed.values())
+
+    # The Settings counter has to agree with the list it sits above; it read
+    # "Aspects defined 2" over a list of one until it used the same predicate.
+    status = client.get("/api/settings/status").json()
+    assert status["analysis"]["aspects_defined"] == len(listed)

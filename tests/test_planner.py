@@ -294,3 +294,99 @@ async def test_a_gateway_failure_never_mixes_category_answers_with_yes_no(live) 
     assert answer["denominator"] < live.db.trace_count()
     assert answer["excluded_count"] > 0
     assert any("excluded rather than guessed" in note for note in answer["work"]["method_notes"])
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_keeps_the_parent_scope_the_planner_did_not_replace(live) -> None:
+    """README: the give-up filter carries forward while the app filter is replaced.
+
+    The planner used to overwrite `spec.predicates` wholesale, so every inherited
+    filter was dropped while the rationale still announced it had carried them.
+    A tester could disprove the sentence by counting the chips on screen.
+    """
+    stub_planner(
+        live,
+        PlannerResult(
+            path="layer1",
+            explanation="where people give up",
+            filter_ids=["the_user_gave_up"],
+            focus="",
+        ),
+    )
+    parent_plan = await live.plan_question("which app do users give up on most")
+    parent = live.create_run(parent_plan)
+
+    stub_planner(
+        live,
+        PlannerResult(path="layer1", explanation="checkout only", filter_ids=["the_app_is_checkout-agent"], focus=""),
+    )
+    child = await live.plan_question("now only the checkout agent", parent_run_id=parent.id)
+
+    fields = {item.field for item in child.filters}
+    assert "app" in fields, f"the planner's own filter is missing: {fields}"
+    assert "user_gave_up" in fields, f"the inherited give-up filter was dropped: {fields}"
+    assert any("Carried 1 filter(s) forward" in line for line in child.rationale)
+    # And the sentence is true: the count is narrower than the app alone.
+    app_only = live.db.fetch_one(
+        "SELECT COUNT(*) AS n FROM traces WHERE app='checkout-agent'"
+    )
+    assert child.eligible_count < int(app_only["n"])
+
+
+@pytest.mark.asyncio
+async def test_unrecognised_planner_filters_do_not_claim_the_question_was_broad(live) -> None:
+    """The compiler's own filters keep executing, so "left broad" would be false."""
+    stub_planner(
+        live,
+        PlannerResult(path="layer1", explanation="shape", filter_ids=["no_such_filter_id"], focus=""),
+    )
+    plan = await live.plan_question("Which failure mode costs me the most?")
+    assert plan.filters, "this question compiles to a filter locally; the test needs one"
+    assert plan.eligible_count < plan.total_count
+    assert not any("was left broad" in line for line in plan.rationale)
+    assert any("Raft's own compiled filters stand" in line for line in plan.rationale)
+    assert any("Ignored unrecognised filter ids" in line for line in plan.rationale)
+
+
+@pytest.mark.asyncio
+async def test_the_plan_bullet_quotes_the_question_that_will_be_evaluated(live) -> None:
+    """The bullet and the confirmation textarea must be the same string.
+
+    The bullet used to be written inside the compiler from its own draft, and
+    `_consult_planner_model` then replaced `aspect_question` without touching
+    the rationale — so the card quoted one wording 200px above the textarea
+    that held another, and the textarea is what gets evaluated.
+    """
+    planner_wording = "Did the assistant give the user a product suggestion?"
+    stub_planner(
+        live,
+        PlannerResult(
+            path="layer3_aspect",
+            explanation="nothing recorded answers this",
+            aspect_question=planner_wording,
+            aspect_type="boolean",
+        ),
+    )
+    plan = await live.plan_question("How many people are getting product suggestions?")
+
+    assert plan.aspect is not None
+    assert plan.aspect.question == planner_wording
+    bullets = [line for line in plan.rationale if line.startswith("Per-trace question:")]
+    assert len(bullets) == 1, f"expected exactly one bullet, got {bullets}"
+    assert bullets[0] == f'Per-trace question: "{planner_wording}"'
+    # And the compiler's own draft must not survive anywhere in the rationale.
+    assert not any("product suggestions?" in line for line in bullets)
+
+
+@pytest.mark.asyncio
+async def test_a_reroute_away_from_layer3_leaves_no_per_trace_bullet(live) -> None:
+    """The bullet is written from the final path, so a re-route cannot strand it."""
+    stub_planner(
+        live,
+        PlannerResult(path="layer1", explanation="this is recorded shape after all", filter_ids=[], focus=""),
+    )
+    plan = await live.plan_question("How many people are getting product suggestions?")
+    # The planner asked for layer1 and a later guard promoted it to
+    # layer2_cluster; either way the point is that it did not stay on layer3.
+    assert plan.path != "layer3_aspect"
+    assert not any(line.startswith("Per-trace question:") for line in plan.rationale)

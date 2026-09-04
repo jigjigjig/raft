@@ -18,5 +18,10 @@ export function StreamingText({ text }: { text: string }) {
     }, 12);
     return () => window.clearInterval(timer);
   }, [reduceMotion, text]);
-  return <p className="streaming-text">{shown}<span aria-hidden="true" className="stream-caret" /></p>;
+  return (
+    <p className="streaming-text">
+      {shown}
+      {shown.length < text.length && <span aria-hidden="true" className="stream-caret" />}
+    </p>
+  );
 }

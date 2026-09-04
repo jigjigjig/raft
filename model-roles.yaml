@@ -19,15 +19,15 @@ roles:
     label: Cluster namer
     workspace_alias: cluster-namer
     api_key_env: OTARI_CLUSTER_NAMER_API_KEY
-    primary: mzai:NousResearch/Hermes-4-70B
+    primary: mzai:NousResearch/Hermes-4-405B
     fallbacks:
-    - mzai:Qwen/Qwen3-30B-A3B-Instruct-2507
+    - mzai:meta-llama/Llama-3.3-70B-Instruct
     job: Name emergent vector clusters
   autopsy_writer:
     label: Autopsy writer
     workspace_alias: autopsy-writer
     api_key_env: OTARI_AUTOPSY_WRITER_API_KEY
-    primary: mzai:NousResearch/Hermes-4-70B
+    primary: mzai:NousResearch/Hermes-4-405B
     fallbacks:
     - mzai:meta-llama/Llama-3.3-70B-Instruct
     job: Write concise trace autopsies

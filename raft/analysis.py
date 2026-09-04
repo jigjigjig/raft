@@ -17,7 +17,7 @@ from raft.config import Settings
 from raft.dataset import DatasetIndex
 from raft.db import Database, utc_now
 from raft.judge import JUDGE_ID, SemanticAspectJudge, scope_text
-from raft.otari import OtariClient, OtariError, SandboxClient, embedding_backend
+from raft.otari import OtariClient, OtariError, SandboxClient, same_model, embedding_backend
 from raft.query import (
     DIMENSIONS,
     METRICS,
@@ -134,6 +134,13 @@ class AnalysisManager:
         if self.settings.raft_otari_mode == "live":
             await self._consult_planner_model(spec)
 
+        self._describe_filters(spec)
+        if spec.path == "layer3_aspect" and spec.aspect_question:
+            # After the planner, so this quotes the question the confirmation
+            # textarea shows and the run actually evaluates. Built in the
+            # compiler it quoted the compiler's draft while the planner's
+            # wording sat 200px below it on the same card.
+            spec.rationale.append(f'Per-trace question: "{spec.aspect_question}"')
         eligible, total = self.count_eligible(spec)
         if eligible == 0 and spec.predicates:
             eligible, total = self._relax(spec)
@@ -359,12 +366,22 @@ class AnalysisManager:
                 chosen.append(predicate)
 
         if chosen:
-            spec.predicates = chosen
+            # README: "the give-up filter carries forward while the app filter is
+            # replaced". A wholesale replace dropped every inherited filter, so
+            # an inherited one survives unless the planner named its own field.
+            inherited_sql = getattr(spec, "inherited_sql", set())
+            replaced_fields = {item.field for item in chosen}
+            carried = [
+                item
+                for item in spec.predicates
+                if item.sql in inherited_sql and item.field not in replaced_fields
+            ]
+            spec.predicates = [*carried, *chosen]
             spec.rationale.append(
                 "The planner read this as: " + " and ".join(f"“{item.label}”" for item in chosen) + "."
             )
         elif parsed.filter_ids:
-            spec.rationale.append("The planner proposed no filter Raft recognises, so the question was left broad.")
+            spec.planner_recognised_nothing = True  # type: ignore[attr-defined]
         if rejected:
             spec.rationale.append("Ignored unrecognised filter ids: " + ", ".join(rejected[:4]) + ".")
 
@@ -432,6 +449,26 @@ class AnalysisManager:
             ],
         }
 
+    def _describe_filters(self, spec: QuerySpec) -> None:
+        """Say what is actually about to be executed, once planning has settled.
+
+        Both of these sentences used to be written at the moment of intent and
+        were then falsified by a later step, so a tester could disprove them by
+        counting the chips on screen.
+        """
+        inherited_sql = getattr(spec, "inherited_sql", set())
+        carried = sum(1 for item in spec.predicates if item.sql in inherited_sql)
+        if carried:
+            spec.rationale.insert(
+                0, f"Carried {carried} filter(s) forward from the previous question."
+            )
+        if getattr(spec, "planner_recognised_nothing", False):
+            spec.rationale.append(
+                "The planner proposed no filter Raft recognises, so the question was left broad."
+                if not spec.predicates
+                else "The planner proposed no filter Raft recognises; Raft's own compiled filters stand."
+            )
+
     def _parent_spec(self, parent_run_id: str | None) -> dict[str, Any] | None:
         if not parent_run_id:
             return None
@@ -446,7 +483,7 @@ class AnalysisManager:
     def _inherit(self, spec: QuerySpec, parent: dict[str, Any]) -> None:
         """Follow-ups keep the previous question's scope unless they replace it."""
         existing = {item.sql for item in spec.predicates}
-        inherited = 0
+        inherited: set[str] = set()
         for raw in parent.get("predicates", []):
             if raw["sql"] in existing:
                 continue
@@ -455,11 +492,13 @@ class AnalysisManager:
             from raft.query import Predicate
 
             spec.predicates.append(Predicate(raw["field"], raw["sql"], tuple(raw["params"]), raw["label"]))
-            inherited += 1
-        if inherited:
-            spec.rationale.insert(
-                0, f"Carried {inherited} filter(s) forward from the previous question."
-            )
+            inherited.add(raw["sql"])
+        # The note is written after planning, from the predicates that survived
+        # it. Claiming the carry here asserted an outcome the planner could still
+        # overturn, and did: "Carried 3 filter(s) forward" printed above a count
+        # that had none of them. Only the sql this call actually added counts as
+        # inherited; the compiler's own predicates are not carried from anywhere.
+        spec.inherited_sql = inherited  # type: ignore[attr-defined]
 
     @staticmethod
     def serialize_spec(spec: QuerySpec) -> dict[str, Any]:
@@ -534,7 +573,10 @@ class AnalysisManager:
         # concurrency of 12, i.e. ~5.4/s. Scale by the configured concurrency
         # and keep a wide upper bound, because hosted latency varies a lot.
         per_second = 5.4 * (self.settings.raft_aspect_concurrency / 12)
-        base = eligible / max(per_second, 1.0)
+        # The floor only exists to avoid dividing by zero. It used to be 1.0,
+        # which quietly clamped every concurrency below ~2.2 to the same
+        # estimate and promised a one-at-a-time run the speed of a parallel one.
+        base = eligible / max(per_second, 0.05)
         return max(5, int(base * 0.7)), max(15, int(base * 1.8))
 
     # ------------------------------------------------------------------
@@ -608,7 +650,7 @@ class AnalysisManager:
         row = self.db.get_run(run_id)
         if not row:
             raise KeyError(run_id)
-        if row["status"] not in ("awaiting_confirmation", "paused_budget"):
+        if row["status"] not in ("awaiting_confirmation", "paused_budget", "paused_provider"):
             raise ValueError(f"Run {run_id} cannot be confirmed from {row['status']}")
         if aspect_question and row["aspect_id"]:
             current = self.db.fetch_one("SELECT * FROM aspects WHERE id=?", (row["aspect_id"],))
@@ -796,20 +838,22 @@ class AnalysisManager:
 
         interpretation = ""
         if self.settings.raft_otari_mode == "live":
-            named = await self._name_clusters_with_model(clusters, trace_ids, record_by_id)
+            named, naming_error = await self._name_clusters_with_model(clusters, trace_ids, record_by_id)
             if named:
                 names.update(named[0])
-            else:
-                notes.append(
-                    f"The cluster-namer model did not answer within "
-                    f"{self.settings.otari_naming_timeout_seconds:.0f}s, so groups keep the name of the request "
-                    "made by the conversation nearest each centre."
-                )
                 # Only the names are taken. The model's own summary sentence is
                 # written without seeing a single count, so it reads as
                 # "these clusters represent various topics" - Raft's own
                 # interpretation is composed from the numbers that were computed.
                 notes.append("Group names written by the cluster-namer model; counts and shares unchanged.")
+            else:
+                # State what was observed. This used to assert a timeout even
+                # when the model had 404'd in under a second, and it printed the
+                # success sentence alongside it.
+                notes.append(
+                    f"The cluster-namer model did not answer ({naming_error}), so groups keep the name "
+                    "of the request made by the conversation nearest each centre."
+                )
 
         rows = [
             {"trace_id": trace_ids[position], "group": str(int(label)), "value": 1.0, "eligible": True}
@@ -919,7 +963,10 @@ class AnalysisManager:
             for position, label in enumerate(labels)
         }
 
-    async def _name_clusters_with_model(self, clusters, trace_ids, record_by_id):
+    async def _name_clusters_with_model(
+        self, clusters, trace_ids, record_by_id
+    ) -> tuple[tuple[dict[str, str], str] | None, str]:
+        """Returns the names and, when there are none, why there are none."""
         # Only the groups the answer actually shows are worth naming, and the
         # model needs a couple of short examples, not five long ones. Sending
         # every cluster in full took over a minute; this is the same output in
@@ -953,12 +1000,18 @@ class AnalysisManager:
                 timeout=self.settings.otari_naming_timeout_seconds,
             )
             if parsed:
-                return parsed.names, parsed.interpretation
-        except Exception:  # noqa: BLE001 - naming is decoration; counts stand alone
+                return (parsed.names, parsed.interpretation), ""
+        except Exception as error:  # noqa: BLE001 - naming is decoration; counts stand alone
             # Group names are cosmetic: Raft already has a name for every group
             # from its own members. Nothing here is worth failing a run over.
-            return None
-        return None
+            return None, self._naming_failure_reason(error)
+        return None, "it returned no names"
+
+    def _naming_failure_reason(self, error: BaseException) -> str:
+        text = str(error).strip()
+        if not text or "timeout" in text.casefold() or "timed out" in text.casefold():
+            return f"no reply within {self.settings.otari_naming_timeout_seconds:.0f} s"
+        return text[:180]
 
     # ------------------------------------------------------------------
     # Layer 3: aspects
@@ -998,13 +1051,11 @@ class AnalysisManager:
             try:
                 notes = await self._evaluate_aspect_live(run_id, aspect, pending, record_by_id, len(trace_ids))
             except OtariError as error:
-                # A gateway hiccup must not end the run, but it must not corrupt
-                # the answer either. The local judge only decides yes/no, so
-                # using it to finish a category run mixes "English" rows with
-                # "yes" rows and produces a total that means nothing. For a
-                # typed aspect the honest move is to answer over what was
-                # actually judged and declare the rest excluded.
-                self.db.update_run(run_id, error=None)
+                # A run that started on Otari never changes judges partway. Two
+                # judges in one total is two scales in one number: it produced a
+                # 1.9% answer whose evidence quotes were about something else
+                # entirely. The rows already judged are kept and the run pauses
+                # resumably, exactly as a budget pause does.
                 remaining = [
                     trace_id
                     for trace_id in trace_ids
@@ -1013,18 +1064,32 @@ class AnalysisManager:
                         (aspect["id"], trace_id),
                     )
                 ]
+                judged = len(trace_ids) - len(remaining)
                 if aspect["type"] == "boolean":
-                    notes = [f"Otari became unavailable partway through ({error}); Raft finished locally."]
-                    notes += self._evaluate_aspect_locally(run_id, aspect, remaining, trace_ids)
-                else:
-                    notes = [
-                        f"Otari became unavailable after judging {len(trace_ids) - len(remaining):,} of "
-                        f"{len(trace_ids):,} conversations ({error}).",
-                        f"The remaining {len(remaining):,} are excluded rather than guessed — this answer's "
-                        "denominator is the judged set only. Resume the run to finish them.",
-                    ]
+                    self.db.update_run(
+                        run_id,
+                        status="paused_provider",
+                        completed=judged,
+                        message=(
+                            f"Otari stopped answering after {judged:,} of {len(trace_ids):,} conversations "
+                            f"({error}). Resume once it recovers."
+                        ),
+                        error=None,
+                    )
+                    return
+                # A category aspect answers over the judged set and declares the
+                # rest excluded, which is a real answer on one scale. Only the
+                # boolean path had a second judge to fall back to, and that is
+                # the substitution this removes.
+                self.db.update_run(run_id, error=None)
+                notes = [
+                    f"Otari became unavailable after judging {judged:,} of "
+                    f"{len(trace_ids):,} conversations ({error}).",
+                    f"The remaining {len(remaining):,} are excluded rather than guessed — this answer's "
+                    "denominator is the judged set only. Resume the run to finish them.",
+                ]
             else:
-                if self.db.get_run(run_id)["status"] == "paused_budget":  # type: ignore[index]
+                if self.db.get_run(run_id)["status"] in ("paused_budget", "paused_provider"):  # type: ignore[index]
                     return
         else:
             notes = self._evaluate_aspect_locally(run_id, aspect, pending, trace_ids)
@@ -1226,10 +1291,32 @@ class AnalysisManager:
             "completed": 0,
             "routing_note": "",
             "paused": None,
+            "pause_status": "paused_budget",
+            "pause_error": None,
             "stop": False,
         }
         lock = asyncio.Lock()
         semaphore = asyncio.Semaphore(max(1, self.settings.raft_aspect_concurrency))
+        # A 5xx from the gateway is transient - the hosted auth service returns
+        # one under burst - so the row is retried before anything else happens.
+        # Failing over to another judge instead is what mixed two scales into
+        # one total; the retry is the whole reason that is no longer necessary.
+        RETRY_DELAYS = (1.0, 3.0, 8.0)
+
+        async def judge_once(trace_id: str):
+            messages = self._aspect_messages(aspect["question"], kind, labels, record_by_id[trace_id])
+            schema = CategoryJudgment if kind == "category" else AspectJudgment
+            for delay in (*RETRY_DELAYS, None):
+                try:
+                    return await self.otari.complete(
+                        "aspect_evaluator", messages, response_schema=schema
+                    )
+                except OtariError as error:
+                    status = error.status_code or 0
+                    if delay is None or not 500 <= status < 600 or state["stop"]:
+                        raise
+                    await asyncio.sleep(delay)
+            raise AssertionError("unreachable")
 
         async def evaluate(trace_id: str) -> None:
             if state["stop"]:
@@ -1239,11 +1326,7 @@ class AnalysisManager:
                     return
                 record = record_by_id[trace_id]
                 try:
-                    completion, judgment = await self.otari.complete(
-                        "aspect_evaluator",
-                        self._aspect_messages(aspect["question"], kind, labels, record),
-                        response_schema=CategoryJudgment if kind == "category" else AspectJudgment,
-                    )
+                    completion, judgment = await judge_once(trace_id)
                     assert judgment
                     value, confidence, raw_quote = self._decode_judgment(judgment, kind, labels)
                     source = f"{record['user_request']}\n{record['summary']}"
@@ -1252,7 +1335,7 @@ class AnalysisManager:
                     async with lock:
                         state["spent"] += item_cost
                         state["completed"] += 1
-                        if completion.model and completion.model != role.primary:
+                        if completion.model and not same_model(completion.model, role.primary):
                             state["routing_note"] = f" · Routing fallback: {role.primary} → {completion.model}"
                         if state["spent"] >= allowance:
                             state["stop"] = True
@@ -1291,6 +1374,16 @@ class AnalysisManager:
                             (trace_id, aspect["id"], "null", 0, role.primary, "aspect-v2", "guardrail_blocked", 0, error.request_id, None, ""),
                         )
                         return
+                    if error.status_code and 500 <= error.status_code < 600:
+                        # Retries are already spent. Stop, keep every judged row,
+                        # and pause resumably rather than finishing on a
+                        # different judge.
+                        async with lock:
+                            state["stop"] = True
+                            state["pause_status"] = "paused_provider"
+                            state["pause_error"] = error
+                            state["paused"] = "provider"
+                        return
                     if error.status_code == 403:
                         async with lock:
                             state["stop"] = True
@@ -1325,11 +1418,23 @@ class AnalysisManager:
 
         elapsed = time.perf_counter() - started
         if state["paused"]:
+            judged = done + int(state["completed"])
+            if state["pause_status"] == "paused_provider" and kind == "category":
+                # A category run has a real partial answer on one scale, so the
+                # caller reports it over the judged set instead of pausing.
+                raise state["pause_error"]
+            if state["pause_status"] == "paused_provider":
+                message = (
+                    f"Otari stopped answering after {judged:,} of {total:,} conversations "
+                    f"({state['pause_error']}). Resume once it recovers."
+                )
+            else:
+                message = str(state["paused"])
             self.db.update_run(
                 run_id,
-                status="paused_budget",
-                completed=done + int(state["completed"]),
-                message=str(state["paused"]),
+                status=state["pause_status"],
+                completed=judged,
+                message=message,
             )
             return []
         self.db.update_run(run_id, completed=total, message="Aspect evaluation complete")
@@ -1858,10 +1963,17 @@ class AnalysisManager:
         if len(real) > 1:
             second = real[1]
             ratio = top.count / max(second.count, 1)
-            if ratio >= 1.6:
+            unit = "conversation" if second.count == 1 else "conversations"
+            if second.count == top.count:
+                # An exact tie was being described as "close behind", which is
+                # prose contradicting the two numbers printed directly above it.
+                parts.append(
+                    f"{second.label} is tied with {top.label} at {second.count:,} {unit}."
+                )
+            elif ratio >= 1.6:
                 parts.append(f"That is {ratio:.1f}× the next group, {second.label}.")
             elif ratio >= 1.0:
-                parts.append(f"{second.label} is close behind at {second.count:,}.")
+                parts.append(f"{second.label} is close behind at {second.count:,} {unit}.")
 
         # A pattern that holds across the whole answer is worth more than any
         # single group, so say it when it is true.

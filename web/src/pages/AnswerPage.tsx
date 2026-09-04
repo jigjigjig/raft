@@ -14,7 +14,17 @@ import { TextResponse, StreamingText } from "../components/aicss/TextOutput";
 import { ThinkingReasoning } from "../components/aicss/ThinkingReasoning";
 import type { AnalysisRun } from "../types";
 
-const terminal = new Set(["complete", "failed", "paused_budget", "guardrail_blocked"]);
+const terminal = new Set(["complete", "failed", "paused_budget", "paused_provider", "guardrail_blocked"]);
+
+// A minutes-long wait read as "439–1129 seconds", which is the last thing
+// someone reads before committing to it. Same range, in units a person counts in.
+function duration(run: { estimate_seconds_min: number; estimate_seconds_max: number }) {
+  const { estimate_seconds_min: low, estimate_seconds_max: high } = run;
+  if (high < 120) return `${low}–${high} seconds`;
+  return `${Math.max(1, Math.round(low / 60))}–${Math.round(high / 60)} minutes`;
+}
+// Both pause states stop the poll, keep their rows, and resume through the same button.
+const paused = new Set(["paused_budget", "paused_provider"]);
 
 const PATH_LABEL: Record<string, string> = {
   layer1: "Recorded trace shape",
@@ -65,7 +75,8 @@ export function AnswerPage() {
   const answer = answerQuery.data;
 
   const confirm = useMutation({
-    mutationFn: () => (run?.status === "paused_budget" ? api.resume(runId) : api.confirm(runId, aspectQuestion)),
+    mutationFn: () =>
+      paused.has(run?.status ?? "") ? api.resume(runId) : api.confirm(runId, aspectQuestion),
     onSuccess: (next) => client.setQueryData(["run", runId], next),
   });
 
@@ -103,10 +114,9 @@ export function AnswerPage() {
         <Link className="parent-link" to={`/answers/${run.parent_run_id}`}>Follow-up · see the question this narrowed</Link>
       )}
 
-      <section className="plan-card">
+      <section className={`plan-card ${run.path}`}>
         <div className="plan-head">
           <span className={`path-badge ${run.path}`}>{PATH_LABEL[run.path] ?? run.path}</span>
-          <span className="plan-summary">{run.planner_note}</span>
         </div>
         <p className="plan-blurb">{PATH_BLURB[run.path]}</p>
         {run.filters?.length > 0 && (
@@ -129,8 +139,8 @@ export function AnswerPage() {
             <div className="eyebrow">NEW ASPECT REQUIRED</div>
             <h2 id="confirm-title">
               {run.estimate_usd > 0
-                ? `About $${run.estimate_usd.toFixed(2)} and ${run.estimate_seconds_min}–${run.estimate_seconds_max} seconds. Run it?`
-                : `About ${run.estimate_seconds_min}–${run.estimate_seconds_max} seconds, no model spend. Run it?`}
+                ? `About $${run.estimate_usd.toFixed(2)} and ${duration(run)}. Run it?`
+                : `About ${duration(run)}, no model spend. Run it?`}
             </h2>
             <p>
               No saved field answers this. Raft will evaluate one reusable question against every eligible conversation
@@ -171,11 +181,15 @@ export function AnswerPage() {
         </div>
       )}
 
-      {run.status === "paused_budget" && (
+      {paused.has(run.status) && (
         <section className="pause-card">
           <PauseCircle size={22} />
           <div>
-            <h2>Run paused before exceeding the budget</h2>
+            <h2>
+              {run.status === "paused_provider"
+                ? "Run paused when Otari stopped answering"
+                : "Run paused before exceeding the budget"}
+            </h2>
             <p>{run.message} Completed rows are saved; no partial total is presented as an answer.</p>
           </div>
           <button className="primary-button" type="button" onClick={() => confirm.mutate()}>Resume missing rows</button>
@@ -213,6 +227,22 @@ export function AnswerPage() {
             <div className="answer-kicker">
               <CheckCircle2 size={15} /> {answer.denominator.toLocaleString()} conversations counted
               {answer.excluded_count > 0 && ` · ${answer.excluded_count.toLocaleString()} outside this question`}
+              <button
+                className="inline-work-toggle"
+                type="button"
+                onClick={() => {
+                  const opening = !showWork;
+                  setShowWork(opening);
+                  // Opening a section below the fold with no movement is no
+                  // feedback at all.
+                  // No `behavior` key: it inherits `scroll-behavior` from CSS,
+                  // which the reduced-motion block forces back to auto.
+                  if (opening) document.querySelector(".work-section")?.scrollIntoView({ block: "start" });
+                }}
+                aria-expanded={showWork}
+              >
+                Show the work
+              </button>
             </div>
             <h2 className="answer-headline">{answer.headline}</h2>
             <TextResponse><StreamingText text={answer.interpretation} /></TextResponse>

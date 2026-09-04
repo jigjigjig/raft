@@ -11,12 +11,17 @@ fail if the judge degenerates into matching everything or nothing.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from raft.judge import SemanticAspectJudge
 from tests.conftest import answer_for
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 # Floors are set below the scores observed on this fixture's 220-trace corpus,
@@ -102,3 +107,84 @@ def test_negated_questions_invert(manager) -> None:
     judge = SemanticAspectJudge(manager.index.index)
     assert judge.analyse("Did the assistant not answer the question?")[0].negated
     assert not judge.analyse("Did the assistant answer the question?")[0].negated
+
+
+def test_the_gateways_own_prefix_is_not_a_reroute() -> None:
+    """Raft asks for `mzai:X`; the gateway answers `X`. That is the same model.
+
+    Comparing them raw recorded a Routing fallback on every single call and put
+    "Routing fallback: mzai:Qwen/... → Qwen/..." on screen mid-run.
+    """
+    from raft.otari import route_key, same_model
+
+    assert same_model("Qwen/Qwen3-30B-A3B-Instruct-2507", "mzai:Qwen/Qwen3-30B-A3B-Instruct-2507")
+    assert same_model("mzai:openai/gpt-oss-120b", "mzai:openai/gpt-oss-120b")
+    assert same_model(None, None)
+    # A real reroute still reads as one.
+    assert not same_model("mzai:Qwen/Qwen3-30B-A3B-Instruct-2507", "mzai:nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
+    assert not same_model("NousResearch/Hermes-4-405B", "mzai:meta-llama/Llama-3.3-70B-Instruct")
+    assert route_key("mzai:google/gemma-3-27b-it") == "google/gemma-3-27b-it"
+
+
+@pytest.mark.asyncio
+async def test_a_model_missing_from_the_catalog_walks_to_the_roles_fallback(tmp_path) -> None:
+    """A 70B vanishing from the catalog killed two roles for a whole evening.
+
+    "The model X does not exist" is the wrong candidate, not a failed request,
+    so the role's declared fallbacks are tried before the call is lost.
+    """
+    import httpx
+
+    from raft.config import Settings
+    from raft.db import Database
+    from raft.otari import OtariClient
+
+    settings = Settings(
+        raft_otari_mode="live",
+        raft_database_path=tmp_path / "raft.db",
+        raft_model_roles_path=ROOT / "model-roles.yaml",
+    )
+    database = Database(settings.raft_database_path)
+    database.initialize()
+    client = OtariClient(settings, database)
+    role = client.role("cluster_namer")
+    asked: list[str] = []
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            model = json.loads(request.content)["model"]
+            asked.append(model)
+            if model == role.primary:
+                return httpx.Response(
+                    404, json={"detail": f"The model `{model}` does not exist."}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "model": model,
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                },
+            )
+
+    original = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = Transport()
+        return original(*args, **kwargs)
+
+    # Deliberately not shaped like a real workspace key: anything carrying the
+    # live key prefix would trip the repo's own secret scan for the rest of time.
+    os.environ[role.api_key_env] = "dummy-key-for-this-test-only"
+    try:
+        httpx.AsyncClient = patched  # type: ignore[misc]
+        result, _ = await client.complete("cluster_namer", [{"role": "user", "content": "hi"}])
+    finally:
+        httpx.AsyncClient = original  # type: ignore[misc]
+        os.environ.pop(role.api_key_env, None)
+
+    assert asked == [role.primary, role.fallbacks[0]], asked
+    assert result.model == role.fallbacks[0]
+    evidence = database.fetch_one("SELECT status, notes FROM feature_evidence WHERE feature='Routing'")
+    assert evidence and "raft_side_fallback" in evidence["status"]
+    assert "does not exist on this deployment" in evidence["notes"]

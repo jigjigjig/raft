@@ -52,7 +52,7 @@ export function TraceDetailPage() {
               <div><dt>Intent</dt><dd>{item.intent_label || "Not recorded"}</dd></div>
               <div><dt>Failure mode</dt><dd>{item.failure_mode.replaceAll("_", " ")}</dd></div>
               <div><dt>Got what they wanted</dt><dd>{item.intent_satisfied}</dd></div>
-              <div><dt>Gave up</dt><dd>{item.user_gave_up ? "Yes" : "No"}</dd></div>
+              <div><dt>Gave up</dt><dd>{item.user_gave_up ? "yes" : "no"}</dd></div>
               <div><dt>Ended by</dt><dd>{item.ended_by}</dd></div>
               <div><dt>Ending sentiment</dt><dd>{item.sentiment_end}</dd></div>
               <div><dt>Turns</dt><dd>{item.turns}</dd></div>
@@ -126,6 +126,15 @@ function CostTrack({ spans, total }: { spans: CollapsedSpan[]; total: number }) 
   );
 }
 
+// A timeline row is a label, not an identifier: `search_catalog` reads as
+// "Search catalog" here while the metadata panel and group cards keep the
+// monospace identifier. Sentence case, not title case - capitalize would
+// have made it "Search Catalog".
+function spanLabel(span: { name?: string | null; type: string }) {
+  const words = (span.name || span.type).replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 function SpanRow({ span, traceCost }: { span: CollapsedSpan; traceCost: number }) {
   const [open, setOpen] = useState(false);
   const explain = useMutation({ mutationFn: () => api.explain(span.id) });
@@ -138,7 +147,7 @@ function SpanRow({ span, traceCost }: { span: CollapsedSpan; traceCost: number }
         <span className="span-index mono">{String(span.index + 1).padStart(2, "0")}</span>
         <span className="span-type">
           {span.status === "error" ? <CircleAlert size={15} /> : <span className="span-dot" />}
-          {span.name || span.type.replaceAll("_", " ")}
+          {spanLabel(span)}
           {span.collapsedCount > 1 && <em className="repeat-badge"><Repeat size={11} /> ×{span.collapsedCount}</em>}
         </span>
         <span className="span-stat"><Clock3 size={13} /> {span.duration_ms ? `${span.duration_ms} ms` : "Unknown"}</span>

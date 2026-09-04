@@ -39,17 +39,27 @@ export function GroupCard({
   showValue: boolean;
 }) {
   const profile = group.profile;
-  const facts: string[] = [];
+  // A group whose top outcome is "resolved" produced the chip twice: once from
+  // top_outcome and once from the resolved count. Same words, same number.
+  const seen = new Set<string>();
+  const rawFacts: string[] = [];
+  const facts: string[] = rawFacts;
+  const push = (fact: string) => {
+    if (!seen.has(fact)) {
+      seen.add(fact);
+      rawFacts.push(fact);
+    }
+  };
   if (profile) {
     if (profile.top_failure && profile.top_failure_count > 0) {
-      facts.push(`${profile.top_failure_count} ${words(profile.top_failure)}`);
+      push(`${profile.top_failure_count} ${words(profile.top_failure)}`);
     } else if (profile.top_outcome && profile.top_outcome_count > 0) {
-      facts.push(`${profile.top_outcome_count} ${words(profile.top_outcome)}`);
+      push(`${profile.top_outcome_count} ${words(profile.top_outcome)}`);
     }
-    if (profile.gave_up > 0) facts.push(`${profile.gave_up} gave up`);
-    if (profile.resolved > 0) facts.push(`${profile.resolved} resolved`);
-    if (profile.avg_turns) facts.push(`${profile.avg_turns} turns avg`);
-    if (profile.cost_usd) facts.push(`$${profile.cost_usd.toFixed(4)}`);
+    if (profile.gave_up > 0) push(`${profile.gave_up} gave up`);
+    if (profile.resolved > 0) push(`${profile.resolved} resolved`);
+    if (profile.avg_turns) push(`${profile.avg_turns} turns avg`);
+    if (profile.cost_usd) push(`$${profile.cost_usd.toFixed(4)}`);
   }
 
   return (
