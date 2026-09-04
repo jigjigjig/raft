@@ -229,14 +229,25 @@ requirement that the five example questions span all three paths.
 
 ## Live Otari gate
 
+0. Measure the gateway's tolerated concurrency immediately before any large run,
+   and set `RAFT_ASPECT_CONCURRENCY` from that measurement rather than from the
+   previous one. The ceiling is perishable: on 4 September 2026 twelve calls in
+   flight returned 200 on every call at midday and 12.5% success the same
+   evening, when three in flight measured 82.5% per call. A run that starts on
+   Otari never switches judges, so a concurrency set above what the gateway
+   tolerates pauses the run instead of finishing it.
 1. Configure every role key from `.env.example` and set `RAFT_OTARI_MODE=live`.
 2. Provision the workspace-level Routing policies, Guardrails, budgets, MCP
    registration, sandbox, and web search.
 3. Run `python scripts/live_smoke.py single-label` before using any downstream
    feature.
 4. Run the 40/20 manual gate in `manual-label-review.md`.
-5. Run `all-models`, `fallback-drill`, `budget-probe`, `code-execution`,
-   `guardrails`, and `web-search` through `scripts/live_smoke.py`.
+5. Run `fallback-drill`, `budget-probe`, `code-execution`, `guardrails`, and
+   `web-search` through `scripts/live_smoke.py`, and exercise the six roles one
+   at a time rather than through `all-models`: that subcommand stops at the
+   first role that raises and leaves the state of every role after it
+   unreported. `GET /api/settings/preflight` is the gate — it checks every
+   configured model of every role against what that role's key can reach.
 6. Replace `pending` evidence in `otari-log.md` immediately after each live
    attempt, using only observed request IDs, errors, costs, latency and
    friction.
